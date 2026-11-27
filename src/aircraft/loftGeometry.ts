@@ -744,7 +744,7 @@ export function buildAirfoilWingGeometry(spec: AirfoilWingSpec): THREE.BufferGeo
     let cx = 0;
     let cy = 0;
     let cz = 0;
-    const count = ringCount - 1;
+    const count = ringCount;
     for (let j = 0; j < count; j++) {
       const base = (row + j) * 3;
       cx += positions[base];

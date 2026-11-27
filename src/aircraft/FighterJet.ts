@@ -601,6 +601,8 @@ export class FighterJet {
         isHero ? -0.12 : -0.14,
         isHero ? -2.02 : -1.85,
       );
+      // Fit blade tips cleanly inside the recessed inner S-duct throat
+      fanRotor.scale.setScalar(isHero ? 0.86 : 0.74);
       const bladeCount = 16;
       for (let b = 0; b < bladeCount; b++) {
         const bladeHolder = new THREE.Group();
@@ -649,21 +651,21 @@ export class FighterJet {
     tub.position.set(0, 0.48, -3.35);
     cockpitGroup.add(tub);
 
-    const glareShield = new THREE.Mesh(new THREE.BoxGeometry(0.84, 0.16, 0.68), this.darkMat);
-    glareShield.position.set(0, 0.80, -4.34);
-    glareShield.rotation.x = 0.24;
+    const glareShield = new THREE.Mesh(new THREE.BoxGeometry(0.80, 0.14, 0.62), this.darkMat);
+    glareShield.position.set(0, 0.77, -4.16);
+    glareShield.rotation.x = 0.22;
     cockpitGroup.add(glareShield);
 
     // Three backlit MFD instrument displays (left radar, centre HSI, right stores)
-    const mfdGeo = new THREE.PlaneGeometry(0.21, 0.17);
+    const mfdGeo = new THREE.PlaneGeometry(0.20, 0.16);
     const mfdOffsets: [number, number, number, number][] = [
-      [-0.25, 0.77, -4.16, 0.18],
-      [0.0, 0.75, -4.18, 0.0],
-      [0.25, 0.77, -4.16, -0.18],
+      [-0.23, 0.75, -3.98, 0.18],
+      [0.0, 0.73, -4.00, 0.0],
+      [0.23, 0.75, -3.98, -0.18],
     ];
     for (let i = 0; i < mfdOffsets.length; i++) {
       const [mx, my, mz, ry] = mfdOffsets[i];
-      const bezel = new THREE.Mesh(new THREE.BoxGeometry(0.24, 0.20, 0.04), this.darkMat);
+      const bezel = new THREE.Mesh(new THREE.BoxGeometry(0.23, 0.19, 0.04), this.darkMat);
       bezel.position.set(mx, my, mz - 0.025);
       bezel.rotation.y = ry;
       bezel.rotation.x = -0.32;
@@ -677,19 +679,20 @@ export class FighterJet {
     }
 
     // HUD combiner frame (twin machined posts + top crossbar) & holographic combiner glass
-    const hudFramePostGeo = new THREE.BoxGeometry(0.03, 0.34, 0.035);
+    // Positioned cleanly inside the forward bubble canopy windscreen envelope
+    const hudFramePostGeo = new THREE.BoxGeometry(0.026, 0.26, 0.03);
     for (const side of [-1, 1] as const) {
       const post = new THREE.Mesh(hudFramePostGeo, this.darkMat);
-      post.position.set(side * 0.24, 1.01, -4.28);
-      post.rotation.x = -0.44;
+      post.position.set(side * 0.20, 0.94, -3.98);
+      post.rotation.x = -0.38;
       cockpitGroup.add(post);
     }
-    const hudTopBar = new THREE.Mesh(new THREE.BoxGeometry(0.51, 0.028, 0.035), this.darkMat);
-    hudTopBar.position.set(0, 1.15, -4.20);
+    const hudTopBar = new THREE.Mesh(new THREE.BoxGeometry(0.43, 0.024, 0.03), this.darkMat);
+    hudTopBar.position.set(0, 1.06, -3.93);
     cockpitGroup.add(hudTopBar);
 
     const hudGlass = new THREE.Mesh(
-      new THREE.PlaneGeometry(0.45, 0.30),
+      new THREE.PlaneGeometry(0.38, 0.24),
       new THREE.MeshBasicMaterial({
         color: isHero ? 0x44ffaa : 0xff3b58,
         transparent: true,
@@ -699,8 +702,8 @@ export class FighterJet {
         depthWrite: false,
       }),
     );
-    hudGlass.position.set(0, 1.02, -4.27);
-    hudGlass.rotation.x = -0.44;
+    hudGlass.position.set(0, 0.94, -3.97);
+    hudGlass.rotation.x = -0.38;
     cockpitGroup.add(hudGlass);
 
     // ACES-II ejection seat with twin metallic ejection seat rails & headrest
@@ -755,7 +758,7 @@ export class FighterJet {
       }),
     );
     visor.position.copy(helmet.position);
-    visor.rotation.y = Math.PI;
+    visor.rotation.y = -Math.PI / 2;
     cockpitGroup.add(visor);
 
     // Sculpted lofted stealth bubble canopy + dark titanium sill & bow frame
@@ -871,6 +874,7 @@ export class FighterJet {
 
       // Articulated trailing-edge flap / aileron hinged flush along wing trailing edge
       const aileronPivot = new THREE.Group();
+      aileronPivot.rotation.order = 'YXZ';
       if (isHero) {
         aileronPivot.position.set(side * 2.85, -0.04, 2.94);
         aileronPivot.rotation.y = side * -0.188;
@@ -1197,7 +1201,7 @@ export class FighterJet {
     body.add(this.afterburnerLight);
 
     // ------------------------------------------------------------------
-    // 8. SUPERSONIC PRANDTL-GLAUERT VAPOR CONE
+    // 8. SUPERSONIC PRANDTL-GLAUERT VAPOUR CONE
     // ------------------------------------------------------------------
     const coneGeo = new THREE.ConeGeometry(5.6, 6.4, 36, 1, true);
     coneGeo.rotateX(-Math.PI / 2);
@@ -1342,7 +1346,7 @@ export class FighterJet {
       (0.75 + 0.25 * Math.sin(time * 62)) *
       this.throttle;
 
-    // 6. Supersonic Prandtl-Glauert vapor cone
+    // 6. Supersonic Prandtl-Glauert vapour cone
     this.vaporMat.uniforms.uTime.value = time;
     this.vaporMat.uniforms.uIntensity.value = this.vaporIntensity;
     this.vaporMat.uniforms.uTrip.value = tripIntensity;

@@ -369,7 +369,7 @@ export function createHullTextureSet(variant: HullVariant): HullTextureSet {
     if (i % 3 === 0) {
       hCtx.fillStyle = '#9c9c9c';
       hCtx.fillRect(hx + 10, hy + 10, hw - 20, hh - 20);
-      // Cooling louver slats
+      // Cooling louvre slats
       for (let ly = hy + 16; ly < hy + hh - 14; ly += 8) {
         hCtx.fillStyle = '#383838';
         hCtx.fillRect(hx + 16, ly, hw - 32, 3);
@@ -604,12 +604,14 @@ export function createHullTextureSet(variant: HullVariant): HullTextureSet {
       eCtx.fillRect(0, sy - 1.5, size, 3);
     }
 
-    // Extra dorsal cyber-seam line for CRIMSON-1 Ace
+    // Extra dorsal cyber-seam line for CRIMSON-1 Ace (u = 0 / 1 maps to dorsal spine)
     if (isAce) {
       eCtx.fillStyle = 'rgba(255, 88, 128, 0.5)';
-      eCtx.fillRect(size * 0.5 - 7, size * 0.22, 14, size * 0.56);
+      eCtx.fillRect(0, size * 0.22, 7, size * 0.56);
+      eCtx.fillRect(size - 7, size * 0.22, 7, size * 0.56);
       eCtx.fillStyle = '#ff4872';
-      eCtx.fillRect(size * 0.5 - 2.5, size * 0.22, 5, size * 0.56);
+      eCtx.fillRect(0, size * 0.22, 3, size * 0.56);
+      eCtx.fillRect(size - 3, size * 0.22, 3, size * 0.56);
     }
   }
 
