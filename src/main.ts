@@ -213,11 +213,18 @@ async function bootstrap(): Promise<void> {
     finaleOverlay.classList.add('hidden');
     controlDock.classList.remove('hidden');
 
-    await audio.unlockAndInit();
     choreography.reset(startTime);
     isPlaying = true;
     syncPlayButton();
-    audio.startPlayback(startTime);
+
+    try {
+      await audio.unlockAndInit();
+      if (isPlaying) {
+        audio.startPlayback(choreography.currentTime);
+      }
+    } catch {
+      // Audio unlock/decode failure must never block visual playback
+    }
   };
 
   const togglePlayPause = async () => {
@@ -233,8 +240,14 @@ async function bootstrap(): Promise<void> {
       }
       finaleOverlay.classList.add('hidden');
       finaleShown = false;
-      await audio.unlockAndInit();
-      audio.startPlayback(choreography.currentTime);
+      try {
+        await audio.unlockAndInit();
+        if (isPlaying) {
+          audio.startPlayback(choreography.currentTime);
+        }
+      } catch {
+        // Audio unlock/decode failure must never block visual playback
+      }
     } else {
       audio.stopMusicAndEngine();
     }

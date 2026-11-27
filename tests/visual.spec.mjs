@@ -573,9 +573,15 @@ async function run() {
     assert.equal(debugCheck.isFrozen, true, 'window.__DOGFIGHT_DEBUG__ must be read-only (frozen)');
     console.log('[PASS] window.__DOGFIGHT_DEBUG__ telemetry interface verified');
 
-    // Click #btn-launch
+    // Click #btn-launch and poll (up to 5s) until playback starts
     await clickSelector(cdp, '#btn-launch');
-    await waitFrames(cdp, 4);
+    const launchDeadline = Date.now() + 5000;
+    while (Date.now() < launchDeadline) {
+      const playing = await cdp.evaluate(`window.__DOGFIGHT_DEBUG__.isPlaying === true`);
+      if (playing) break;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    await waitFrames(cdp, 2);
 
     const launchState = await cdp.evaluate(`(() => ({
       overlayHidden: document.getElementById('launch-overlay').classList.contains('hidden'),
@@ -797,13 +803,20 @@ async function run() {
     console.log('ALL VISUAL & UI VERIFICATION CHECKS PASSED');
   } finally {
     if (cdp) cdp.close();
-    if (chromeProc) {
+    if (chromeProc && chromeProc.exitCode === null && chromeProc.signalCode === null) {
+      const exited = new Promise((resolve) => chromeProc.once('exit', resolve));
       chromeProc.kill('SIGTERM');
-      await new Promise((r) => setTimeout(r, 200));
-      if (chromeProc.exitCode === null) chromeProc.kill('SIGKILL');
+      const result = await Promise.race([
+        exited,
+        new Promise((resolve) => setTimeout(() => resolve('timeout'), 2000)),
+      ]);
+      if (result === 'timeout' && chromeProc.exitCode === null) {
+        chromeProc.kill('SIGKILL');
+        await Promise.race([exited, new Promise((resolve) => setTimeout(resolve, 1000))]);
+      }
     }
     server.close();
-    fs.rmSync(userDataDir, { recursive: true, force: true });
+    fs.rmSync(userDataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 }
 

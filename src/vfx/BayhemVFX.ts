@@ -768,8 +768,8 @@ export class BayhemVFX {
       this._missileLook.copy(m.pos).add(this._curDir);
       m.mesh.lookAt(this._missileLook);
 
-      m.trailPositions.unshift(m.pos.clone());
-      if (m.trailPositions.length > 64) m.trailPositions.pop();
+      const trailPt = m.trailPositions.length >= 64 ? m.trailPositions.pop()!.copy(m.pos) : m.pos.clone();
+      m.trailPositions.unshift(trailPt);
       if (m.prism) {
         m.trailMat.color.setHSL((time * 0.35 + i * 0.18) % 1.0, 1.0, 0.62);
       }
@@ -881,11 +881,11 @@ export class BayhemVFX {
       const c = this.contrails[i];
       if (c.jet.alive) {
         c.jet.getWorldWingtips(this._lTip, this._rTip);
-        c.leftPts.unshift(this._lTip.clone());
-        c.rightPts.unshift(this._rTip.clone());
+        const lPt = c.leftPts.length >= RIBBON_SEGMENTS ? c.leftPts.pop()!.copy(this._lTip) : this._lTip.clone();
+        const rPt = c.rightPts.length >= RIBBON_SEGMENTS ? c.rightPts.pop()!.copy(this._rTip) : this._rTip.clone();
+        c.leftPts.unshift(lPt);
+        c.rightPts.unshift(rPt);
       }
-      if (c.leftPts.length > RIBBON_SEGMENTS) c.leftPts.pop();
-      if (c.rightPts.length > RIBBON_SEGMENTS) c.rightPts.pop();
 
       if (tripIntensity > 0.12) {
         c.mat.color.setHSL((time * 0.25 + i * 0.19) % 1.0, 0.95, 0.65);
