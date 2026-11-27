@@ -43,19 +43,17 @@ const PUFF_VERT = /* glsl */ `
 
     float c = cos(aMeta.z);
     float s = sin(aMeta.z);
-    vec2 rotated = vec2(
-      position.x * c - position.y * s,
-      position.x * s + position.y * c
-    );
+    vec3 rotRight = camRight * c + camUp * s;
+    vec3 rotUp = -camRight * s + camUp * c;
 
-    vec3 worldPos = aPosScale.xyz + (camRight * rotated.x + camUp * rotated.y) * aPosScale.w;
+    vec3 worldPos = aPosScale.xyz + (rotRight * position.x + rotUp * position.y) * aPosScale.w;
 
     vLocalPos = position.xy * 2.0;
     vWorldCenter = aPosScale.xyz;
     vMeta = aMeta;
     vColorAlpha = aColorAlpha;
-    vCamRight = camRight;
-    vCamUp = camUp;
+    vCamRight = rotRight;
+    vCamUp = rotUp;
     vCamForward = camForward;
 
     gl_Position = projectionMatrix * viewMatrix * vec4(worldPos, 1.0);
@@ -269,7 +267,7 @@ const SPARK_FRAG = /* glsl */ `
 
     // Tapered incandescent needle: bright white-hot head tapering into a fiery wake
     float crossProfile = pow(max(1.0 - across, 1e-4), 1.85);
-    float headCap = smoothstep(1.0, 0.72, along);
+    float headCap = 1.0 - smoothstep(0.72, 1.0, along);
     float tailTaper = pow(max(along, 1e-4), 0.75);
     float mask = crossProfile * headCap * tailTaper;
     if (mask < 0.01) discard;

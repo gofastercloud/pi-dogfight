@@ -216,7 +216,7 @@ const PRANDTL_GLAUERT_FRAG = /* glsl */ `
     float rim = pow(max(1.0 - ndotv, 1e-4), 1.9 + uShellIndex * 0.6);
 
     float rings = 0.72 + 0.28 * sin(vUv.y * 28.0 - uTime * 36.0 + uShellIndex * 1.7);
-    float axial = smoothstep(0.0, 0.22, vUv.y) * smoothstep(1.0, 0.28, vUv.y);
+    float axial = smoothstep(0.0, 0.22, vUv.y) * (1.0 - smoothstep(0.28, 1.0, vUv.y));
     float streaks = 0.75 + 0.25 * sin(vUv.x * 42.0 + uTime * 14.0);
 
     vec3 refractBase = mix(vec3(0.92, 0.97, 1.05), vec3(0.68, 0.92, 1.35), uShellIndex);
@@ -278,7 +278,7 @@ const HEAT_SHIMMER_FRAG = /* glsl */ `
     float diamonds = pow(max(sin(along * 30.0 + uTime * 42.0) * 0.5 + 0.5, 1e-4), 3.0);
     float haze = 0.65 + 0.35 * sin(vUv.x * 24.0 + uTime * 35.0) * cos(along * 18.0 - uTime * 48.0);
 
-    float fadeEnds = smoothstep(0.0, 0.32, along) * smoothstep(1.0, 0.85, along);
+    float fadeEnds = smoothstep(0.0, 0.32, along) * (1.0 - smoothstep(0.85, 1.0, along));
     vec3 col = mix(vec3(0.55, 0.78, 1.15), uAccentColor * 1.8, diamonds * 0.72 + uTrip * 0.25);
     float alpha = fadeEnds * (0.08 + rim * 0.28 + diamonds * 0.22) * haze * clamp(uThrottle - 0.35, 0.0, 1.2);
     if (alpha < 0.006) discard;
@@ -648,6 +648,8 @@ export class BayhemVFX {
     });
     this.tracerInst = new THREE.InstancedMesh(this.tracerGeo, tracerMat, MAX_TRACERS);
     this.tracerInst.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    this.tracerInst.setColorAt(0, this._tracerGold);
+    this.tracerInst.instanceColor!.setUsage(THREE.DynamicDrawUsage);
     this.tracerInst.frustumCulled = false;
     this.tracerInst.count = 0;
     this.group.add(this.tracerInst);
@@ -1783,6 +1785,12 @@ export class BayhemVFX {
       const jet = c.jet;
 
       if (jet.alive) {
+        if (!c.leftRibbon.active || c.leftRibbon.detached) {
+          c.leftRibbon.clearPoints();
+        }
+        if (!c.rightRibbon.active || c.rightRibbon.detached) {
+          c.rightRibbon.clearPoints();
+        }
         jet.getWorldWingtips(this._lTip, this._rTip);
         c.leftRibbon.pushPoint(this._lTip.x, this._lTip.y, this._lTip.z, 1.15);
         c.rightRibbon.pushPoint(this._rTip.x, this._rTip.y, this._rTip.z, 1.15);
@@ -1857,22 +1865,30 @@ export class BayhemVFX {
           c.shimmerLeft.scale.set(1, 1, stretch);
           c.shimmerRight.scale.set(1, 1, stretch);
         }
+
+        const baseHex = jet.role === 'hero' ? 0xdff5ff : jet.role === 'ace' ? 0xff4477 : 0xffaa88;
+        const gBoost = Math.min(0.85, Math.max(0, jet.gForce - 1) * 0.14);
+        const opacity = tripIntensity > 0.12
+          ? 0.44 + tripIntensity * 0.34
+          : 0.34 + Math.min(0.32, Math.max(0, jet.gForce - 1) * 0.055);
+        const width = 0.48 + gBoost;
+        const prismOn = tripIntensity > 0.14;
+
+        c.leftRibbon.setDynamicAppearance(baseHex, opacity, width, prismOn);
+        c.rightRibbon.setDynamicAppearance(baseHex, opacity, width, prismOn);
+        c.leftRibbon.rebuildGeometry(camPos);
+        c.rightRibbon.rebuildGeometry(camPos);
       } else {
         c.aeroGroup.visible = false;
+        if (c.leftRibbon.active && !c.leftRibbon.detached) {
+          if (c.leftRibbon.getSpinePointCount() >= 2) c.leftRibbon.detach(1.4);
+          else c.leftRibbon.reset();
+        }
+        if (c.rightRibbon.active && !c.rightRibbon.detached) {
+          if (c.rightRibbon.getSpinePointCount() >= 2) c.rightRibbon.detach(1.4);
+          else c.rightRibbon.reset();
+        }
       }
-
-      const baseHex = jet.role === 'hero' ? 0xdff5ff : jet.role === 'ace' ? 0xff4477 : 0xffaa88;
-      const gBoost = Math.min(0.85, Math.max(0, jet.gForce - 1) * 0.14);
-      const opacity = tripIntensity > 0.12
-        ? 0.44 + tripIntensity * 0.34
-        : 0.34 + Math.min(0.32, Math.max(0, jet.gForce - 1) * 0.055);
-      const width = 0.48 + gBoost;
-      const prismOn = tripIntensity > 0.14;
-
-      c.leftRibbon.setDynamicAppearance(baseHex, opacity, width, prismOn);
-      c.rightRibbon.setDynamicAppearance(baseHex, opacity, width, prismOn);
-      c.leftRibbon.rebuildGeometry(camPos);
-      c.rightRibbon.rebuildGeometry(camPos);
     }
 
     // 6. Step GPU-instanced particle engine & lingering volumetric trails

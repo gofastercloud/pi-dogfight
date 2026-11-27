@@ -92,7 +92,7 @@ const RIBBON_FRAG = /* glsl */ `
 
     // Cylindrical volumetric density: crisp core near emitter, wispy billowing smoke near tail
     float edgeSoft = mix(0.28, 0.72, prog);
-    float radialDensity = smoothstep(1.0, 1.0 - edgeSoft, r + (0.5 - turb) * (0.22 + prog * 0.42));
+    float radialDensity = 1.0 - smoothstep(1.0 - edgeSoft, 1.0, r + (0.5 - turb) * (0.22 + prog * 0.42));
     float coreThickness = pow(max(cylZ, 1e-4), 1.15);
 
     // Sunlit volumetric cross-section shading
@@ -124,8 +124,8 @@ const RIBBON_FRAG = /* glsl */ `
       float tailMask = pow(max(1.0 - prog, 1e-4), 1.05);
 
       // Blazing rocket motor exhaust ignition right behind the nozzle
-      float motorGlow = smoothstep(0.13, 0.0, prog) * pow(max(cylZ, 1e-4), 1.5);
-      vec3 ignitionCol = mix(vec3(2.2, 0.78, 0.18), vec3(3.6, 2.8, 1.75), smoothstep(0.07, 0.0, prog));
+      float motorGlow = (1.0 - smoothstep(0.0, 0.13, prog)) * pow(max(cylZ, 1e-4), 1.5);
+      vec3 ignitionCol = mix(vec3(2.2, 0.78, 0.18), vec3(3.6, 2.8, 1.75), 1.0 - smoothstep(0.0, 0.07, prog));
 
       // Thick billowing backlit exhaust smoke
       vec3 smokeLit = mix(vec3(0.26, 0.24, 0.30), vec3(0.92, 0.84, 0.78), sunBias * (0.62 + 0.42 * turb)) * sunTint;
@@ -144,7 +144,7 @@ const RIBBON_FRAG = /* glsl */ `
       // DECOY COUNTERMEASURE FLARE RIBBON
       float headMask = smoothstep(0.0, 0.02, prog);
       float tailMask = pow(max(1.0 - prog, 1e-4), 1.25);
-      float flareCore = smoothstep(0.24, 0.0, prog) * pow(max(cylZ, 1e-4), 1.6);
+      float flareCore = (1.0 - smoothstep(0.0, 0.24, prog)) * pow(max(cylZ, 1e-4), 1.6);
 
       vec3 smokeCol = vec3(0.92, 0.85, 0.76) * sunTint * (0.55 + 0.55 * turb) * sunBias;
       vec3 magCore = vec3(4.2, 2.75, 1.1);
@@ -305,7 +305,11 @@ export class VolumetricRibbon {
 
   public clearPoints(): void {
     this.count = 0;
+    this.active = true;
+    this.detached = false;
+    this.fadeAge = 0;
     this.mesh.visible = false;
+    this.material.uniforms.uFade.value = 1.0;
   }
 
   public detach(fadeDuration = 1.25): void {
@@ -686,11 +690,21 @@ export class MissileTrailSystem {
   ): void {
     const safeDt = Math.max(0, Math.min(dt, 0.05));
 
-    // Update contrail shader uniforms
+    // Update contrail shader uniforms & fade out any detached contrails from downed jets
     for (let i = 0; i < this.contrailRibbons.length; i++) {
       const r = this.contrailRibbons[i];
       r.material.uniforms.uTime.value = time;
       r.material.uniforms.uTrip.value = tripIntensity;
+      if (r.detached) {
+        r.fadeAge += safeDt;
+        const fade = Math.max(0, 1 - r.fadeAge / r.fadeDuration);
+        r.material.uniforms.uFade.value = fade;
+        if (fade <= 0.005) {
+          r.reset();
+        } else {
+          r.rebuildGeometry(camPos);
+        }
+      }
     }
 
     // Update active & lingering missile ribbons
