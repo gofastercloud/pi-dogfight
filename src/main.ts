@@ -13,6 +13,39 @@ import { PostPipeline } from './post/PostPipeline';
 import { AudioEngine } from './audio/AudioEngine';
 import { FighterHUD } from './ui/FighterHUD';
 
+export interface DogfightCanvasStats {
+  meanLuminance: number;
+  lumVariance: number;
+  colourVariance: number;
+  nonBlackRatio: number;
+  sampleCount: number;
+}
+
+export interface DogfightDebugState {
+  readonly currentTime: number;
+  readonly camMode: CameraMode;
+  readonly cameraTag: string;
+  readonly cameraPosition: readonly [number, number, number];
+  readonly cameraUp: readonly [number, number, number];
+  readonly hudEnabled: boolean;
+  readonly tripIntensity: number;
+  readonly isPlaying: boolean;
+  readonly fps: number;
+}
+
+export interface DogfightDebugApi extends DogfightDebugState {
+  getState(): DogfightDebugState;
+  seek(t: number): void;
+  setCamera(mode: CameraMode): void;
+  sampleCanvasStats(): DogfightCanvasStats;
+}
+
+declare global {
+  interface Window {
+    __DOGFIGHT_DEBUG__?: DogfightDebugApi;
+  }
+}
+
 function formatTime(sec: number): string {
   const s = Math.max(0, Math.floor(sec));
   const m = Math.floor(s / 60);
@@ -122,17 +155,51 @@ async function bootstrap(): Promise<void> {
   let isScrubbing = false;
   let camMode: CameraMode = 'auto';
   let userTripOverride: number | null = null;
+  let lastTripIntensity = 0;
+  let currentFps = 60;
   let finaleShown = false;
+
+  const orbitOffset = new THREE.Vector3(42, 18, 46);
+  const prevOrbitHeroPos = new THREE.Vector3();
+  const heroDelta = new THREE.Vector3();
+
+  const renderHudNow = (realTime: number, tripIntensity: number) => {
+    hud.render(
+      realTime,
+      choreography.hero,
+      choreography.bandits,
+      choreography.lockedTarget,
+      choreography.isMissileLocked,
+      camera,
+      choreography.activeCameraTag,
+      tripIntensity,
+      choreography.timeScale,
+    );
+  };
 
   const setCameraMode = (mode: CameraMode) => {
     camMode = mode;
     orbitControls.enabled = mode === 'orbit';
+    const nowSec = performance.now() / 1000;
     if (mode === 'orbit') {
-      orbitControls.target.copy(choreography.hero.group.position);
-      camera.position.copy(choreography.hero.group.position).add(new THREE.Vector3(28, 12, 34));
+      camera.up.set(0, 1, 0);
+      const heroPos = choreography.hero.group.position;
+      orbitControls.target.copy(heroPos);
+      camera.position.copy(heroPos).add(orbitOffset);
+      camera.position.y = Math.max(12, camera.position.y);
+      prevOrbitHeroPos.copy(heroPos);
+      camera.fov = 60;
+      camera.updateProjectionMatrix();
       orbitControls.update();
+      choreography.updateCamera(0.016, nowSec, camera, 'orbit', true);
+    } else {
+      choreography.updateCamera(0.016, nowSec, camera, mode, true);
     }
     camButtons.forEach((b) => b.classList.toggle('active', b.dataset.cam === mode));
+    if (hasLaunched) {
+      const activeTrip = userTripOverride !== null ? userTripOverride : lastTripIntensity;
+      renderHudNow(nowSec, activeTrip);
+    }
   };
 
   const syncPlayButton = () => {
@@ -229,11 +296,13 @@ async function bootstrap(): Promise<void> {
   tripSlider.addEventListener('input', () => {
     const val = parseFloat(tripSlider.value);
     userTripOverride = val;
+    lastTripIntensity = val;
     tripValueEl.textContent = `${Math.round(val * 100)}%`;
   });
 
   tripSlider.addEventListener('dblclick', () => {
     userTripOverride = null;
+    lastTripIntensity = choreography.autoTripIntensity;
     tripValueEl.textContent = 'AUTO';
   });
 
@@ -259,10 +328,12 @@ async function bootstrap(): Promise<void> {
     } else if (e.key.toLowerCase() === 'l') {
       if (userTripOverride === null || userTripOverride < 1.2) {
         userTripOverride = 1.45;
+        lastTripIntensity = 1.45;
         tripSlider.value = '1.45';
         tripValueEl.textContent = '145%';
       } else {
         userTripOverride = null;
+        lastTripIntensity = choreography.autoTripIntensity;
         tripSlider.value = '1.0';
         tripValueEl.textContent = 'AUTO';
       }
@@ -292,57 +363,45 @@ async function bootstrap(): Promise<void> {
   });
 
   // ------------------------------------------------------------------
-  // 4. MAIN ANIMATION LOOP
+  // 4. DETERMINISTIC DEBUG & VERIFICATION HOOK
   // ------------------------------------------------------------------
-  let lastNow = performance.now();
-  let fpsAccum = 0;
-  let fpsFrames = 0;
-
-  const animate = (now: number) => {
-    requestAnimationFrame(animate);
-
-    const rawDt = Math.min((now - lastNow) / 1000, 0.08);
-    lastNow = now;
-    const realTime = now / 1000;
-
-    // FPS counter
-    fpsAccum += rawDt;
-    fpsFrames++;
-    if (fpsAccum >= 0.5) {
-      perfReadout.textContent = `${Math.round(fpsFrames / fpsAccum)} FPS`;
-      fpsAccum = 0;
-      fpsFrames = 0;
-    }
-
-    if (!hasLaunched) {
-      // Lush live idling hero fly-past behind the title card
-      choreography.currentTime = 4.2;
-      const { tripIntensity } = choreography.update(rawDt, realTime, camera, 'cinematic', 0.12, false);
-      env.update(realTime, rawDt, camera.position, 0.08, tripIntensity, 0);
-      vfx.update(rawDt, realTime, camera, tripIntensity, 0.3);
-      post.update(realTime, tripIntensity, 0, 0.2);
-      post.render();
-      return;
-    }
-
+  const applySceneFrame = (dt: number, realTime: number, advanceSim: boolean, forceCamSnap = false) => {
     const { tripIntensity } = choreography.update(
-      rawDt,
+      dt,
       realTime,
       camera,
       camMode,
       userTripOverride,
-      isPlaying && !isScrubbing,
+      advanceSim,
     );
+    lastTripIntensity = tripIntensity;
+
+    if (forceCamSnap && camMode !== 'orbit') {
+      choreography.updateCamera(dt, realTime, camera, camMode, true);
+    }
 
     if (camMode === 'orbit') {
-      orbitControls.target.lerp(choreography.hero.group.position, 0.08);
+      if (forceCamSnap) {
+        const heroPos = choreography.hero.group.position;
+        orbitControls.target.copy(heroPos);
+        camera.position.copy(heroPos).add(orbitOffset);
+        camera.position.y = Math.max(12, camera.position.y);
+        prevOrbitHeroPos.copy(heroPos);
+      } else {
+        heroDelta.subVectors(choreography.hero.group.position, prevOrbitHeroPos);
+        if (heroDelta.lengthSq() > 1e-8) {
+          orbitControls.target.add(heroDelta);
+          camera.position.add(heroDelta);
+          prevOrbitHeroPos.copy(choreography.hero.group.position);
+        }
+      }
       orbitControls.update();
     }
 
-    const simDt = isPlaying && !isScrubbing ? rawDt * choreography.timeScale : 0;
+    const simDt = advanceSim ? dt * choreography.timeScale : 0;
     env.update(
       realTime,
-      rawDt,
+      dt,
       camera.position,
       choreography.stormIntensity,
       tripIntensity,
@@ -366,19 +425,173 @@ async function bootstrap(): Promise<void> {
       choreography.speedIntensity,
     );
     post.render();
+    renderHudNow(realTime, tripIntensity);
+  };
 
-    // Update 2D Fighter HUD overlay
-    hud.render(
-      realTime,
-      choreography.hero,
-      choreography.bandits,
-      choreography.lockedTarget,
-      choreography.isMissileLocked,
-      camera,
-      choreography.activeCameraTag,
-      tripIntensity,
-      choreography.timeScale,
-    );
+  let pixelReadBuf: Uint8Array | null = null;
+  const sampleCanvasStats = (): DogfightCanvasStats => {
+    post.render();
+    const gl = renderer.getContext();
+    const w = gl.drawingBufferWidth;
+    const h = gl.drawingBufferHeight;
+    const needed = w * h * 4;
+    if (!pixelReadBuf || pixelReadBuf.length !== needed) {
+      pixelReadBuf = new Uint8Array(needed);
+    }
+    gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, pixelReadBuf);
+
+    // Sample central 3D viewport (excluding letterbox bands and dock)
+    const x0 = Math.floor(w * 0.08);
+    const x1 = Math.floor(w * 0.92);
+    const y0 = Math.floor(h * 0.24);
+    const y1 = Math.floor(h * 0.88);
+    const step = 4;
+
+    let count = 0;
+    let sumLum = 0;
+    let sumLumSq = 0;
+    let sumR = 0;
+    let sumG = 0;
+    let sumB = 0;
+    let sumRSq = 0;
+    let sumGSq = 0;
+    let sumBSq = 0;
+    let nonBlack = 0;
+
+    for (let y = y0; y < y1; y += step) {
+      const rowStart = y * w * 4;
+      for (let x = x0; x < x1; x += step) {
+        const idx = rowStart + x * 4;
+        const r = pixelReadBuf[idx];
+        const g = pixelReadBuf[idx + 1];
+        const b = pixelReadBuf[idx + 2];
+        const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+        sumLum += lum;
+        sumLumSq += lum * lum;
+        sumR += r;
+        sumG += g;
+        sumB += b;
+        sumRSq += r * r;
+        sumGSq += g * g;
+        sumBSq += b * b;
+        if (lum > 4) nonBlack++;
+        count++;
+      }
+    }
+
+    const safeCount = Math.max(count, 1);
+    const meanLuminance = sumLum / safeCount;
+    const lumVariance = Math.max(0, sumLumSq / safeCount - meanLuminance * meanLuminance);
+    const varR = Math.max(0, sumRSq / safeCount - (sumR / safeCount) ** 2);
+    const varG = Math.max(0, sumGSq / safeCount - (sumG / safeCount) ** 2);
+    const varB = Math.max(0, sumBSq / safeCount - (sumB / safeCount) ** 2);
+
+    return {
+      meanLuminance,
+      lumVariance,
+      colourVariance: varR + varG + varB,
+      nonBlackRatio: nonBlack / safeCount,
+      sampleCount: count,
+    };
+  };
+
+  const readState = (): DogfightDebugState => ({
+    currentTime: choreography.currentTime,
+    camMode,
+    cameraTag: choreography.activeCameraTag,
+    cameraPosition: [camera.position.x, camera.position.y, camera.position.z],
+    cameraUp: [camera.up.x, camera.up.y, camera.up.z],
+    hudEnabled: hud.enabled,
+    tripIntensity: userTripOverride !== null ? userTripOverride : lastTripIntensity,
+    isPlaying,
+    fps: currentFps,
+  });
+
+  const debugApi: DogfightDebugApi = Object.freeze({
+    get currentTime() {
+      return choreography.currentTime;
+    },
+    get camMode() {
+      return camMode;
+    },
+    get cameraTag() {
+      return choreography.activeCameraTag;
+    },
+    get cameraPosition(): readonly [number, number, number] {
+      return [camera.position.x, camera.position.y, camera.position.z];
+    },
+    get cameraUp(): readonly [number, number, number] {
+      return [camera.up.x, camera.up.y, camera.up.z];
+    },
+    get hudEnabled() {
+      return hud.enabled;
+    },
+    get tripIntensity() {
+      return userTripOverride !== null ? userTripOverride : lastTripIntensity;
+    },
+    get isPlaying() {
+      return isPlaying;
+    },
+    get fps() {
+      return currentFps;
+    },
+    getState: readState,
+    seek(t: number) {
+      const targetT = THREE.MathUtils.clamp(Number(t) || 0, 0, TOTAL_DURATION);
+      choreography.reset(targetT);
+      applySceneFrame(0.016, targetT, false, true);
+      scrubber.value = choreography.currentTime.toFixed(2);
+      timeCurrentEl.textContent = formatTime(choreography.currentTime);
+    },
+    setCamera(mode: CameraMode) {
+      setCameraMode(mode);
+    },
+    sampleCanvasStats,
+  });
+  Object.defineProperty(window, '__DOGFIGHT_DEBUG__', {
+    value: debugApi,
+    writable: false,
+    configurable: false,
+    enumerable: true,
+  });
+
+  // ------------------------------------------------------------------
+  // 5. MAIN ANIMATION LOOP
+  // ------------------------------------------------------------------
+  let lastNow = performance.now();
+  let fpsAccum = 0;
+  let fpsFrames = 0;
+
+  const animate = (now: number) => {
+    requestAnimationFrame(animate);
+
+    const rawDt = Math.min((now - lastNow) / 1000, 0.08);
+    lastNow = now;
+    const realTime = now / 1000;
+
+    // FPS counter
+    fpsAccum += rawDt;
+    fpsFrames++;
+    if (fpsAccum >= 0.5) {
+      currentFps = Math.round(fpsFrames / fpsAccum);
+      perfReadout.textContent = `${currentFps} FPS`;
+      fpsAccum = 0;
+      fpsFrames = 0;
+    }
+
+    if (!hasLaunched) {
+      // Lush live idling hero fly-past behind the title card
+      choreography.currentTime = 4.2;
+      const { tripIntensity } = choreography.update(rawDt, realTime, camera, 'cinematic', 0.12, false);
+      lastTripIntensity = tripIntensity;
+      env.update(realTime, rawDt, camera.position, 0.08, tripIntensity, 0);
+      vfx.update(rawDt, realTime, camera, tripIntensity, 0.3);
+      post.update(realTime, tripIntensity, 0, 0.2);
+      post.render();
+      return;
+    }
+
+    applySceneFrame(rawDt, realTime, isPlaying && !isScrubbing, false);
 
     // Update Web Audio continuous engine bed
     audio.updateContinuous(choreography.hero.throttle, choreography.timeScale, isPlaying);

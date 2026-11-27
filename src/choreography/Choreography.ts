@@ -118,6 +118,15 @@ export class DogfightChoreography {
   private smoothCamPos = new THREE.Vector3(0, 48, 120);
   private smoothCamLook = new THREE.Vector3(0, 42, -100);
   private lastShotCutId = '';
+  private readonly _pos = new THREE.Vector3();
+  private readonly _fwd = new THREE.Vector3();
+  private readonly _desiredPos = new THREE.Vector3();
+  private readonly _desiredLook = new THREE.Vector3();
+  private readonly _jetUp = new THREE.Vector3();
+  private readonly _shakeVec = new THREE.Vector3();
+  private readonly _auxVec = new THREE.Vector3();
+  private readonly _mDir = new THREE.Vector3();
+  private readonly _supernovaFocus = new THREE.Vector3(55, 530, -1495);
 
   constructor(
     scene: THREE.Scene,
@@ -369,8 +378,8 @@ export class DogfightChoreography {
     // 1. UPDATE HERO & BANDIT POSES
     // ------------------------------------------------------------------
     const uHero = THREE.MathUtils.clamp(t / TOTAL_DURATION, 0, 1);
-    const pos = new THREE.Vector3();
-    const fwd = new THREE.Vector3();
+    const pos = this._pos;
+    const fwd = this._fwd;
     let heroBank = this.sampleFlight(this.heroCurve, uHero, pos, fwd);
 
     // Extra dramatic hero stunts: barrel roll in Act I, Cobra pitch-up in Act IV, victory roll in Act V
@@ -660,34 +669,42 @@ export class DogfightChoreography {
     return { tripIntensity };
   }
 
-  private updateCamera(
+  public updateCamera(
     dt: number,
     realTime: number,
     camera: THREE.PerspectiveCamera,
     mode: CameraMode,
+    forceSnap = false,
   ): void {
     if (mode === 'orbit') {
       this.activeCameraTag = 'FREE ORBIT';
-      return; // Handled by OrbitControls in main.ts
+      this.lastShotCutId = 'orbit';
+      camera.up.set(0, 1, 0);
+      return; // Handled by OrbitControls in main.ts without overwriting user drag
     }
 
     const t = this.currentTime;
-    const desiredPos = new THREE.Vector3();
-    const desiredLook = new THREE.Vector3();
+    const desiredPos = this._desiredPos;
+    const desiredLook = this._desiredLook;
     let targetFov = 64;
     let hardCutId: string = mode;
+    let useJetUp = false;
 
     const heroPos = this.hero.group.position;
     const heroQ = this.hero.group.quaternion;
 
     if (mode === 'cockpit') {
+      this.hero.group.updateMatrixWorld(true);
       this.hero.cockpitAnchor.getWorldPosition(desiredPos);
-      desiredLook.set(0, 0.8, -140).applyQuaternion(heroQ).add(heroPos);
+      desiredLook.set(0, 0.2, -160).applyQuaternion(heroQ).add(desiredPos);
       targetFov = 74;
       this.activeCameraTag = 'COCKPIT HUD';
+      const isCut = forceSnap || this.lastShotCutId !== 'cockpit';
+      this.lastShotCutId = 'cockpit';
+      camera.up.set(0, 1, 0).applyQuaternion(heroQ).normalize();
       camera.position.copy(desiredPos);
       camera.lookAt(desiredLook);
-      camera.fov = THREE.MathUtils.lerp(camera.fov, targetFov, Math.min(1, dt * 8));
+      camera.fov = isCut ? targetFov : THREE.MathUtils.lerp(camera.fov, targetFov, Math.min(1, dt * 8));
       camera.updateProjectionMatrix();
       return;
     }
@@ -699,7 +716,11 @@ export class DogfightChoreography {
       this.activeCameraTag = 'TAIL CHASE';
     } else if (mode === 'cinematic') {
       const a = realTime * 0.55;
-      desiredPos.copy(heroPos).add(new THREE.Vector3(Math.cos(a) * 28, 7 + Math.sin(a * 1.3) * 8, Math.sin(a) * 28));
+      desiredPos.set(
+        heroPos.x + Math.cos(a) * 34,
+        heroPos.y + 10 + Math.sin(a * 1.3) * 6,
+        heroPos.z + Math.sin(a) * 34,
+      );
       desiredLook.copy(heroPos);
       targetFov = 54;
       this.activeCameraTag = 'BAYHEM ORBIT';
@@ -710,7 +731,9 @@ export class DogfightChoreography {
         this.activeCameraTag = 'LOW SEA SKIM';
         desiredPos.set(16, -2.2, -26).applyQuaternion(heroQ).add(heroPos);
         desiredPos.y = Math.max(11, desiredPos.y);
-        desiredLook.copy(heroPos).add(new THREE.Vector3(0, 2, 10));
+        desiredLook.copy(heroPos);
+        desiredLook.y += 2;
+        desiredLook.z += 10;
         targetFov = 58;
       } else if (t < 13.5) {
         hardCutId = 'cut_wingtip_mach';
@@ -727,34 +750,40 @@ export class DogfightChoreography {
       } else if (t < 24.4) {
         hardCutId = 'cut_cockpit_guns';
         this.activeCameraTag = 'COCKPIT GUNSIGHT';
+        this.hero.group.updateMatrixWorld(true);
         this.hero.cockpitAnchor.getWorldPosition(desiredPos);
-        desiredLook.set(0, 0.4, -120).applyQuaternion(heroQ).add(heroPos);
+        desiredLook.set(0, 0.2, -160).applyQuaternion(heroQ).add(desiredPos);
         targetFov = 68;
+        useJetUp = true;
       } else if (t < 29.0) {
         hardCutId = 'cut_w2_pyro';
         this.activeCameraTag = 'SLOW-MO PYRO PASS';
         desiredPos.set(-22, 9, 18).applyQuaternion(heroQ).add(heroPos);
-        desiredLook.copy(heroPos).add(new THREE.Vector3(0, 0, -24).applyQuaternion(heroQ));
+        this._auxVec.set(0, 0, -24).applyQuaternion(heroQ);
+        desiredLook.copy(heroPos).add(this._auxVec);
         targetFov = 62;
       } else if (t < 38.0) {
         hardCutId = 'cut_supercell_climb';
         this.activeCameraTag = 'SUPERCELL ASCENT';
         desiredPos.set(18, -4.5, 24).applyQuaternion(heroQ).add(heroPos);
-        desiredLook.copy(heroPos).add(new THREE.Vector3(0, 6, -45).applyQuaternion(heroQ));
+        this._auxVec.set(0, 6, -45).applyQuaternion(heroQ);
+        desiredLook.copy(heroPos).add(this._auxVec);
         targetFov = 72;
       } else if (t < 44.5) {
         hardCutId = 'cut_monolith_pan';
         this.activeCameraTag = 'MONOLITH CATHEDRAL';
         const sweep = (t - 38.0) * 0.42;
-        desiredPos.copy(heroPos).add(new THREE.Vector3(Math.cos(sweep) * 34, 11, Math.sin(sweep) * 34));
+        desiredPos.set(heroPos.x + Math.cos(sweep) * 34, heroPos.y + 11, heroPos.z + Math.sin(sweep) * 34);
         desiredLook.copy(heroPos);
         targetFov = 66;
       } else if (t < 49.8 && this.featuredMissile && this.featuredMissile.alive) {
         hardCutId = 'cut_missile_cam';
         this.activeCameraTag = 'SIDEWINDER NOSE CAM';
-        const mDir = this.featuredMissile.vel.clone().normalize();
-        desiredPos.copy(this.featuredMissile.pos).addScaledVector(mDir, -14).add(new THREE.Vector3(2.5, 3.2, 0));
-        desiredLook.copy(this.featuredMissile.pos).addScaledVector(mDir, 45);
+        this._mDir.copy(this.featuredMissile.vel).normalize();
+        desiredPos.copy(this.featuredMissile.pos).addScaledVector(this._mDir, -14);
+        desiredPos.x += 2.5;
+        desiredPos.y += 3.2;
+        desiredLook.copy(this.featuredMissile.pos).addScaledVector(this._mDir, 45);
         targetFov = 78;
       } else if (t < 56.2) {
         hardCutId = 'cut_ace_duel';
@@ -767,15 +796,21 @@ export class DogfightChoreography {
         hardCutId = 'cut_cobra_360';
         this.activeCameraTag = '360° COBRA BULLET-TIME';
         const angle = ((t - 56.2) / 7.0) * Math.PI * 2.2 + 0.6;
-        desiredPos.copy(heroPos).add(new THREE.Vector3(Math.cos(angle) * 24, 4 + Math.sin(angle * 2) * 5, Math.sin(angle) * 24));
+        desiredPos.set(
+          heroPos.x + Math.cos(angle) * 24,
+          heroPos.y + 4 + Math.sin(angle * 2) * 5,
+          heroPos.z + Math.sin(angle) * 24,
+        );
         desiredLook.copy(heroPos);
         targetFov = 56;
       } else if (t < 69.2) {
         hardCutId = 'cut_macross_salvo';
         this.activeCameraTag = 'MACROSS PRISM SALVO';
         if (this.featuredMissile && this.featuredMissile.alive && t > 65.2) {
-          const mDir = this.featuredMissile.vel.clone().normalize();
-          desiredPos.copy(this.featuredMissile.pos).addScaledVector(mDir, -24).add(new THREE.Vector3(-8, 6, 0));
+          this._mDir.copy(this.featuredMissile.vel).normalize();
+          desiredPos.copy(this.featuredMissile.pos).addScaledVector(this._mDir, -24);
+          desiredPos.x -= 8;
+          desiredPos.y += 6;
           desiredLook.copy(this.ace.alive ? this.ace.group.position : this.featuredMissile.pos);
           targetFov = 74;
         } else {
@@ -787,7 +822,7 @@ export class DogfightChoreography {
         hardCutId = 'cut_supernova_wide';
         this.activeCameraTag = 'THERMOBARIC SUPERNOVA';
         desiredPos.set(34, 14, 42).applyQuaternion(heroQ).add(heroPos);
-        desiredLook.copy(heroPos).lerp(new THREE.Vector3(55, 530, -1495), 0.55);
+        desiredLook.copy(heroPos).lerp(this._supernovaFocus, 0.55);
         targetFov = 72;
       } else if (t < 81.5) {
         hardCutId = 'cut_victory_roll';
@@ -798,14 +833,15 @@ export class DogfightChoreography {
       } else {
         hardCutId = 'cut_vertical_sun';
         this.activeCameraTag = 'VERTICAL SUNRISE';
-        desiredPos.copy(heroPos).add(new THREE.Vector3(38, -28, 42));
-        desiredLook.copy(heroPos).add(new THREE.Vector3(-12, 24, -18));
+        desiredPos.set(heroPos.x + 38, heroPos.y - 28, heroPos.z + 42);
+        desiredLook.set(heroPos.x - 12, heroPos.y + 24, heroPos.z - 18);
         targetFov = 66;
       }
     }
 
     // Snap cleanly on director cut transitions, smooth damp inside each shot
-    if (hardCutId !== this.lastShotCutId) {
+    const didSnap = forceSnap || hardCutId !== this.lastShotCutId;
+    if (didSnap) {
       this.lastShotCutId = hardCutId;
       this.smoothCamPos.copy(desiredPos);
       this.smoothCamLook.copy(desiredLook);
@@ -819,20 +855,27 @@ export class DogfightChoreography {
     // Prevent camera from dipping under ocean waves
     this.smoothCamPos.y = Math.max(10, this.smoothCamPos.y);
 
+    if (useJetUp) {
+      this._jetUp.set(0, 1, 0).applyQuaternion(heroQ).normalize();
+      camera.up.copy(this._jetUp);
+    } else {
+      camera.up.set(0, 1, 0);
+    }
+
     // Apply kinetic Michael Bay camera shake
     const shakeMag = this.cameraShake * 2.4 + this.speedIntensity * 0.14;
-    const shakeVec = new THREE.Vector3(
+    this._shakeVec.set(
       (Math.sin(realTime * 47.3) + Math.cos(realTime * 81.7)) * 0.5 * shakeMag,
       (Math.cos(realTime * 53.1) + Math.sin(realTime * 67.9)) * 0.5 * shakeMag,
-      (Math.sin(realTime * 39.7)) * 0.5 * shakeMag,
+      Math.sin(realTime * 39.7) * 0.5 * shakeMag,
     );
 
-    camera.position.copy(this.smoothCamPos).add(shakeVec);
+    camera.position.copy(this.smoothCamPos).add(this._shakeVec);
     camera.lookAt(this.smoothCamLook);
 
     // Dynamic FOV punch during high-speed / explosions
     const dynamicFov = targetFov + this.speedIntensity * 6.0 + this.vfx.shockImpact * 7.5;
-    camera.fov = THREE.MathUtils.lerp(camera.fov, dynamicFov, Math.min(1, dt * 6));
+    camera.fov = didSnap ? dynamicFov : THREE.MathUtils.lerp(camera.fov, dynamicFov, Math.min(1, dt * 6));
     camera.updateProjectionMatrix();
   }
 }

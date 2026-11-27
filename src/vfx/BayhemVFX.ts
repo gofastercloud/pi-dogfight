@@ -32,16 +32,22 @@ const FIREBALL_VERT = /* glsl */ `
     );
   }
 
+  vec3 safeNormalize(vec3 v) {
+    float len = length(v);
+    return len > 1e-5 ? v / len : vec3(0.0, 1.0, 0.0);
+  }
+
   void main() {
     vec3 p = position;
-    float n1 = noise(normalize(p) * 3.4 + vec3(0.0, -uTime * 1.4, uProgress * 2.5));
-    float n2 = noise(normalize(p) * 7.2 - vec3(uTime * 2.2, uProgress * 4.0, 0.0));
+    vec3 dirP = safeNormalize(p);
+    float n1 = noise(dirP * 3.4 + vec3(0.0, -uTime * 1.4, uProgress * 2.5));
+    float n2 = noise(dirP * 7.2 - vec3(uTime * 2.2, uProgress * 4.0, 0.0));
     float disp = (n1 * 0.65 + n2 * 0.35);
     vDisp = disp;
     p += normal * (disp - 0.35) * (0.45 + uProgress * 0.75);
     vec4 mvPos = modelViewMatrix * vec4(p, 1.0);
     vViewPos = -mvPos.xyz;
-    vNormal = normalize(normalMatrix * normal);
+    vNormal = safeNormalize(normalMatrix * normal);
     gl_Position = projectionMatrix * mvPos;
   }
 `;
@@ -54,6 +60,11 @@ const FIREBALL_FRAG = /* glsl */ `
   uniform float uTrip;
   uniform float uSupernova;
 
+  vec3 safeNormalize(vec3 v) {
+    float len = length(v);
+    return len > 1e-5 ? v / len : vec3(0.0, 0.0, 1.0);
+  }
+
   vec3 hsv2rgb(vec3 c) {
     vec4 K = vec4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
     vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
@@ -61,7 +72,7 @@ const FIREBALL_FRAG = /* glsl */ `
   }
 
   void main() {
-    float ndotv = clamp(abs(dot(normalize(vNormal), normalize(vViewPos))), 0.0, 1.0);
+    float ndotv = clamp(abs(dot(safeNormalize(vNormal), safeNormalize(vViewPos))), 0.0, 1.0);
     // Cool down from blinding white plasma -> molten orange -> glowing soot
     float heat = clamp((1.0 - uProgress * 0.92) + (vDisp - 0.42) * 0.85, 0.0, 1.4);
 
@@ -76,7 +87,7 @@ const FIREBALL_FRAG = /* glsl */ `
 
     if (uTrip > 0.15 || uSupernova > 0.5) {
       vec3 prism = hsv2rgb(vec3(fract(vDisp * 2.2 - uProgress * 1.4), 0.95, 1.0)) * 2.4;
-      float rim = pow(1.0 - ndotv, 1.6);
+      float rim = pow(max(1.0 - ndotv, 1e-4), 1.6);
       col += prism * rim * max(uTrip * 0.8, uSupernova * 1.1) * (1.0 - uProgress * 0.65);
     }
 
@@ -179,6 +190,15 @@ export class BayhemVFX {
   private readonly speedLines: THREE.LineSegments;
   private readonly speedLinesMat: THREE.LineBasicMaterial;
   private readonly dummy = new THREE.Object3D();
+  private readonly _ribbonDir = new THREE.Vector3();
+  private readonly _ribbonToCam = new THREE.Vector3();
+  private readonly _ribbonSide = new THREE.Vector3();
+  private readonly _sparkLook = new THREE.Vector3();
+  private readonly _lTip = new THREE.Vector3();
+  private readonly _rTip = new THREE.Vector3();
+  private readonly _toTarget = new THREE.Vector3();
+  private readonly _curDir = new THREE.Vector3();
+  private readonly _missileLook = new THREE.Vector3();
 
   private readonly fireballGeo = new THREE.IcosahedronGeometry(1, 4);
   private readonly shockRingGeo = new THREE.TorusGeometry(1, 0.065, 12, 48);
@@ -631,9 +651,9 @@ export class BayhemVFX {
     }
     mesh.visible = true;
 
-    const dir = new THREE.Vector3();
-    const toCam = new THREE.Vector3();
-    const side = new THREE.Vector3();
+    const dir = this._ribbonDir;
+    const toCam = this._ribbonToCam;
+    const side = this._ribbonSide;
 
     for (let i = 0; i < maxPts; i++) {
       const idx = Math.min(i, pts.length - 1);
@@ -644,8 +664,12 @@ export class BayhemVFX {
       if (dir.lengthSq() < 0.0001) dir.set(0, 0, -1);
       dir.normalize();
 
-      toCam.subVectors(camPos, p).normalize();
-      side.crossVectors(dir, toCam).normalize();
+      toCam.subVectors(camPos, p);
+      if (toCam.lengthSq() < 0.0001) toCam.set(0, 1, 0);
+      toCam.normalize();
+      side.crossVectors(dir, toCam);
+      if (side.lengthSq() < 0.0001) side.set(1, 0, 0);
+      side.normalize();
 
       const t = i / Math.max(1, pts.length - 1);
       const halfW = width * (0.25 + 0.75 * Math.sin(t * Math.PI));
@@ -714,8 +738,8 @@ export class BayhemVFX {
         m.targetPoint.copy(m.target.group.position);
       }
 
-      const toTarget = m.targetPoint.clone().sub(m.pos);
-      const dist = toTarget.length();
+      this._toTarget.subVectors(m.targetPoint, m.pos);
+      const dist = this._toTarget.length();
       if (dist < 22) {
         m.alive = false;
         m.onImpact?.(m.pos.clone());
@@ -724,7 +748,7 @@ export class BayhemVFX {
         continue;
       }
 
-      const desiredDir = toTarget.normalize();
+      const desiredDir = this._toTarget.divideScalar(Math.max(dist, 1e-4));
       // Add subtle Macross corkscrew weave early in flight
       if (m.age < 1.2) {
         const spiral = Math.sin(m.age * 16 + i * 1.7) * 0.35 * (1 - m.age / 1.2);
@@ -733,13 +757,16 @@ export class BayhemVFX {
         desiredDir.normalize();
       }
 
-      const curDir = m.vel.clone().normalize();
-      curDir.lerp(desiredDir, Math.min(1, dt * m.turnRate)).normalize();
-      m.vel.copy(curDir).multiplyScalar(m.speed);
+      this._curDir.copy(m.vel);
+      if (this._curDir.lengthSq() < 1e-4) this._curDir.set(0, 0, -1);
+      else this._curDir.normalize();
+      this._curDir.lerp(desiredDir, Math.min(1, dt * m.turnRate)).normalize();
+      m.vel.copy(this._curDir).multiplyScalar(m.speed);
       m.pos.addScaledVector(m.vel, dt);
 
       m.mesh.position.copy(m.pos);
-      m.mesh.lookAt(m.pos.clone().add(curDir));
+      this._missileLook.copy(m.pos).add(this._curDir);
+      m.mesh.lookAt(this._missileLook);
 
       m.trailPositions.unshift(m.pos.clone());
       if (m.trailPositions.length > 64) m.trailPositions.pop();
@@ -811,7 +838,8 @@ export class BayhemVFX {
 
       const scale = s.size * (1 - s.age / s.life);
       this.dummy.position.copy(s.pos);
-      this.dummy.lookAt(s.pos.clone().add(s.vel));
+      this._sparkLook.copy(s.pos).add(s.vel);
+      this.dummy.lookAt(this._sparkLook);
       this.dummy.scale.set(scale, scale, scale * (1.2 + s.vel.length() * 0.015));
       this.dummy.updateMatrix();
       this.sparkInst.setMatrixAt(sparkCount, this.dummy.matrix);
@@ -849,14 +877,12 @@ export class BayhemVFX {
     this.debrisInst.instanceMatrix.needsUpdate = true;
 
     // 7. Update wingtip contrail ribbons
-    const lTip = new THREE.Vector3();
-    const rTip = new THREE.Vector3();
     for (let i = 0; i < this.contrails.length; i++) {
       const c = this.contrails[i];
       if (c.jet.alive) {
-        c.jet.getWorldWingtips(lTip, rTip);
-        c.leftPts.unshift(lTip.clone());
-        c.rightPts.unshift(rTip.clone());
+        c.jet.getWorldWingtips(this._lTip, this._rTip);
+        c.leftPts.unshift(this._lTip.clone());
+        c.rightPts.unshift(this._rTip.clone());
       }
       if (c.leftPts.length > RIBBON_SEGMENTS) c.leftPts.pop();
       if (c.rightPts.length > RIBBON_SEGMENTS) c.rightPts.pop();

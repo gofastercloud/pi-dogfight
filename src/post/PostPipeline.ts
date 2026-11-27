@@ -4,6 +4,39 @@ import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
 import { ShaderPass } from 'three/examples/jsm/postprocessing/ShaderPass.js';
 
+const SANITISE_HDR_SHADER = {
+  uniforms: {
+    tDiffuse: { value: null },
+  },
+  vertexShader: /* glsl */ `
+    varying vec2 vUv;
+    void main() {
+      vUv = uv;
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    }
+  `,
+  fragmentShader: /* glsl */ `
+    uniform sampler2D tDiffuse;
+    varying vec2 vUv;
+
+    float sanitiseChannel(float v) {
+      if (isnan(v) || isinf(v)) return 0.0;
+      return clamp(v, 0.0, 64.0);
+    }
+
+    void main() {
+      vec4 tex = texture2D(tDiffuse, vUv);
+      vec3 col = vec3(
+        sanitiseChannel(tex.r),
+        sanitiseChannel(tex.g),
+        sanitiseChannel(tex.b)
+      );
+      float a = (isnan(tex.a) || isinf(tex.a)) ? 1.0 : clamp(tex.a, 0.0, 1.0);
+      gl_FragColor = vec4(col, a);
+    }
+  `,
+};
+
 const BAY_SCOTT_LSD_SHADER = {
   uniforms: {
     tDiffuse: { value: null },
@@ -30,12 +63,13 @@ const BAY_SCOTT_LSD_SHADER = {
     varying vec2 vUv;
 
     vec3 acesFilm(vec3 x) {
+      vec3 v = max(x, vec3(0.0));
       float a = 2.51;
       float b = 0.03;
       float c = 2.43;
       float d = 0.59;
       float e = 0.14;
-      return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+      return clamp((v * (a * v + b)) / max(v * (c * v + d) + e, vec3(1e-4)), 0.0, 1.0);
     }
 
     float rand(vec2 co) {
@@ -48,6 +82,14 @@ const BAY_SCOTT_LSD_SHADER = {
       return col * cosA + cross(k, col) * sin(angle) + k * dot(k, col) * (1.0 - cosA);
     }
 
+    float sanitise(float v) {
+      return (isnan(v) || isinf(v)) ? 0.0 : clamp(v, 0.0, 64.0);
+    }
+
+    vec3 sanitiseVec3(vec3 c) {
+      return vec3(sanitise(c.r), sanitise(c.g), sanitise(c.b));
+    }
+
     void main() {
       vec2 uv = vUv;
       vec2 centered = uv - 0.5;
@@ -56,17 +98,19 @@ const BAY_SCOTT_LSD_SHADER = {
       // Subtle peripheral psychedelic wave distortion (keeps centre crisp for action)
       if (uTrip > 0.15) {
         float edgeMask = smoothstep(0.24, 0.72, dist);
-        float angle = atan(centered.y, centered.x);
+        float safeX = (abs(centered.x) < 1e-5 && abs(centered.y) < 1e-5) ? 1e-5 : centered.x;
+        float angle = atan(centered.y, safeX);
         float ripple = sin(dist * 24.0 - uTime * 3.8 + angle * 4.0) * 0.0045 * uTrip * edgeMask;
-        uv += normalize(centered + 0.0001) * ripple;
+        vec2 radialDir = dist > 1e-4 ? centered / dist : vec2(1.0, 0.0);
+        uv += radialDir * ripple;
       }
 
       // Dynamic radial chromatic aberration (spikes on sonic booms, impacts, and LSD peaks)
       float caAmt = 0.0014 + uShock * 0.014 + uSpeed * 0.003 + uTrip * 0.0065;
       vec2 caVec = centered * caAmt;
-      float r = texture2D(tDiffuse, uv + caVec).r;
-      float g = texture2D(tDiffuse, uv).g;
-      float b = texture2D(tDiffuse, uv - caVec).b;
+      float r = sanitise(texture2D(tDiffuse, uv + caVec).r);
+      float g = sanitise(texture2D(tDiffuse, uv).g);
+      float b = sanitise(texture2D(tDiffuse, uv - caVec).b);
       vec3 col = vec3(r, g, b);
 
       // Anamorphic horizontal lens flare streak synthesis (Michael Bay / Ridley Scott glass)
@@ -75,7 +119,7 @@ const BAY_SCOTT_LSD_SHADER = {
       for (int i = -6; i <= 6; i++) {
         float fi = float(i);
         float w = exp(-abs(fi) * 0.28);
-        vec3 s = texture2D(tDiffuse, vec2(uv.x + fi * texelX * 14.0, uv.y)).rgb;
+        vec3 s = sanitiseVec3(texture2D(tDiffuse, vec2(uv.x + fi * texelX * 14.0, uv.y)).rgb);
         float lum = dot(s, vec3(0.299, 0.587, 0.114));
         streak += max(s - 0.92, 0.0) * smoothstep(0.85, 1.65, lum) * w;
       }
@@ -108,13 +152,14 @@ const BAY_SCOTT_LSD_SHADER = {
       float vig = smoothstep(0.95, 0.28, dist * (1.05 + uSpeed * 0.25));
       col *= mix(0.45, 1.0, vig);
 
-      gl_FragColor = vec4(col, 1.0);
+      gl_FragColor = vec4(clamp(col, 0.0, 1.0), 1.0);
     }
   `,
 };
 
 export class PostPipeline {
   public readonly composer: EffectComposer;
+  public readonly sanitisePass: ShaderPass;
   public readonly bloomPass: UnrealBloomPass;
   public readonly finalPass: ShaderPass;
 
@@ -129,6 +174,10 @@ export class PostPipeline {
 
     this.composer = new EffectComposer(renderer, rt);
     this.composer.addPass(new RenderPass(scene, camera));
+
+    // Sanitise any NaN/Inf HDR radiance values before bloom so Apple Metal/ANGLE cannot black out the frame
+    this.sanitisePass = new ShaderPass(SANITISE_HDR_SHADER);
+    this.composer.addPass(this.sanitisePass);
 
     this.bloomPass = new UnrealBloomPass(new THREE.Vector2(w, h), 0.68, 0.52, 0.84);
     this.composer.addPass(this.bloomPass);

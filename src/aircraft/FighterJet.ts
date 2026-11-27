@@ -10,6 +10,11 @@ const AFTERBURNER_VERT = /* glsl */ `
   uniform float uTime;
   uniform float uThrottle;
 
+  vec3 safeNormalize(vec3 v) {
+    float len = length(v);
+    return len > 1e-5 ? v / len : vec3(0.0, 1.0, 0.0);
+  }
+
   void main() {
     vUv = uv;
     vec3 p = position;
@@ -19,7 +24,7 @@ const AFTERBURNER_VERT = /* glsl */ `
     p.y *= 1.0 - flutter;
     vec4 mvPos = modelViewMatrix * vec4(p, 1.0);
     vViewPos = -mvPos.xyz;
-    vNormal = normalize(normalMatrix * normal);
+    vNormal = safeNormalize(normalMatrix * normal);
     gl_Position = projectionMatrix * mvPos;
   }
 `;
@@ -34,6 +39,11 @@ const AFTERBURNER_FRAG = /* glsl */ `
   uniform vec3 uCoreColor;
   uniform vec3 uOuterColor;
 
+  vec3 safeNormalize(vec3 v) {
+    float len = length(v);
+    return len > 1e-5 ? v / len : vec3(0.0, 0.0, 1.0);
+  }
+
   vec3 hsv2rgb(vec3 c) {
     vec4 K = vec4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
     vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
@@ -43,10 +53,12 @@ const AFTERBURNER_FRAG = /* glsl */ `
   void main() {
     // vUv.y = 0 at wide nozzle base, 1 at far pointed tip
     float along = 1.0 - vUv.y;
-    float fresnel = pow(abs(dot(normalize(vNormal), normalize(vViewPos))), 0.65);
+    vec3 n = safeNormalize(vNormal);
+    vec3 v = safeNormalize(vViewPos);
+    float fresnel = pow(max(abs(dot(n, v)), 1e-4), 0.65);
 
     // Supersonic Mach shock diamonds pulsing along the jet wash
-    float diamonds = pow(max(0.0, sin(along * 26.0 + uTime * 34.0) * 0.5 + 0.5), 2.4);
+    float diamonds = pow(max(sin(along * 26.0 + uTime * 34.0) * 0.5 + 0.5, 1e-4), 2.4);
     float flicker = 0.85 + 0.15 * sin(uTime * 90.0 + along * 14.0);
 
     vec3 core = uCoreColor;
@@ -72,11 +84,16 @@ const VAPOR_CONE_VERT = /* glsl */ `
   varying vec3 vNormal;
   varying vec3 vViewPos;
 
+  vec3 safeNormalize(vec3 v) {
+    float len = length(v);
+    return len > 1e-5 ? v / len : vec3(0.0, 1.0, 0.0);
+  }
+
   void main() {
     vUv = uv;
     vec4 mvPos = modelViewMatrix * vec4(position, 1.0);
     vViewPos = -mvPos.xyz;
-    vNormal = normalize(normalMatrix * normal);
+    vNormal = safeNormalize(normalMatrix * normal);
     gl_Position = projectionMatrix * mvPos;
   }
 `;
@@ -89,14 +106,19 @@ const VAPOR_CONE_FRAG = /* glsl */ `
   uniform float uTime;
   uniform float uTrip;
 
+  vec3 safeNormalize(vec3 v) {
+    float len = length(v);
+    return len > 1e-5 ? v / len : vec3(0.0, 0.0, 1.0);
+  }
+
   vec3 rainbow(float t) {
     return 0.55 + 0.45 * cos(6.28318 * (t + vec3(0.0, 0.33, 0.67)));
   }
 
   void main() {
     if (uIntensity < 0.01) discard;
-    float ndotv = abs(dot(normalize(vNormal), normalize(vViewPos)));
-    float rim = pow(1.0 - ndotv, 1.85);
+    float ndotv = clamp(abs(dot(safeNormalize(vNormal), safeNormalize(vViewPos))), 0.0, 1.0);
+    float rim = pow(max(1.0 - ndotv, 1e-4), 1.85);
     float streak = 0.7 + 0.3 * sin(vUv.x * 38.0 + uTime * 16.0) * sin(vUv.y * 18.0 - uTime * 22.0);
     float edgeFade = smoothstep(0.0, 0.28, vUv.y) * smoothstep(1.0, 0.35, vUv.y);
 
@@ -145,6 +167,15 @@ export class FighterJet {
   private readonly strobeMeshes: THREE.Mesh[] = [];
   private readonly prevPos = new THREE.Vector3();
   private readonly prevVel = new THREE.Vector3();
+  private readonly _accel = new THREE.Vector3();
+  private readonly _lookTarget = new THREE.Vector3();
+  private readonly _upAxis = new THREE.Vector3(0, 1, 0);
+  private readonly _rollAxis = new THREE.Vector3(0, 0, -1);
+  private readonly _pitchAxis = new THREE.Vector3(1, 0, 0);
+  private readonly _lookMat = new THREE.Matrix4();
+  private readonly _poseQ = new THREE.Quaternion();
+  private readonly _rollQ = new THREE.Quaternion();
+  private readonly _pitchQ = new THREE.Quaternion();
 
   constructor(id: string, callsign: string, role: FighterRole) {
     this.id = id;
@@ -531,8 +562,9 @@ export class FighterJet {
     // ------------------------------------------------------------------
     // 7. ANCHORS FOR CAMERAS, GUNS & WINGTIP CONTRAILS
     // ------------------------------------------------------------------
+    // Positioned cleanly above & forward of the opaque canopy sill for an unobstructed cockpit view
     this.cockpitAnchor = new THREE.Object3D();
-    this.cockpitAnchor.position.set(0, 1.38, -3.55);
+    this.cockpitAnchor.position.set(0, 1.85, -4.8);
     body.add(this.cockpitAnchor);
 
     this.chaseAnchor = new THREE.Object3D();
@@ -561,8 +593,8 @@ export class FighterJet {
   ): void {
     if (dt > 0.0001) {
       this.velocity.subVectors(pos, this.prevPos).divideScalar(dt);
-      const accel = this.velocity.clone().sub(this.prevVel).divideScalar(Math.max(dt, 0.016));
-      this.gForce = THREE.MathUtils.lerp(this.gForce, 1.0 + Math.min(11.5, accel.length() / 22), 0.14);
+      this._accel.subVectors(this.velocity, this.prevVel).divideScalar(Math.max(dt, 0.016));
+      this.gForce = THREE.MathUtils.lerp(this.gForce, 1.0 + Math.min(11.5, this._accel.length() / 22), 0.14);
       this.prevVel.copy(this.velocity);
       this.speed = THREE.MathUtils.lerp(this.speed, Math.max(95, this.velocity.length()), 0.15);
     }
@@ -570,19 +602,19 @@ export class FighterJet {
 
     this.group.position.copy(pos);
 
-    const lookTarget = pos.clone().add(forward);
-    const up = new THREE.Vector3(0, 1, 0);
-    const mat = new THREE.Matrix4().lookAt(pos, lookTarget, up);
-    const q = new THREE.Quaternion().setFromRotationMatrix(mat);
+    this._lookTarget.copy(pos).add(forward);
+    this._lookMat.lookAt(pos, this._lookTarget, this._upAxis);
+    this._poseQ.setFromRotationMatrix(this._lookMat);
 
     // Apply aerodynamic banking roll and optional Cobra pitch-up
-    const rollQ = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, -1), bankRad);
-    q.multiply(rollQ);
+    this._rollQ.setFromAxisAngle(this._rollAxis, bankRad);
+    this._poseQ.multiply(this._rollQ);
     if (Math.abs(extraPitchRad) > 0.001) {
-      const pitchQ = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), extraPitchRad);
-      q.multiply(pitchQ);
+      this._pitchQ.setFromAxisAngle(this._pitchAxis, extraPitchRad);
+      this._poseQ.multiply(this._pitchQ);
     }
-    this.group.quaternion.copy(q);
+    this.group.quaternion.copy(this._poseQ);
+    this.group.updateMatrixWorld(true);
   }
 
   public updateVisuals(time: number, tripIntensity: number): void {
