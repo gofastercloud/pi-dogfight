@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SOLAR MACH: CHROMATIC VIPER</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <div id="viewport">
+      <canvas id="scene-canvas"></canvas>
+      <canvas id="hud-canvas"></canvas>
+
+      <!-- Cinematic Anamorphic Letterbox Bars -->
+      <div class="letterbox letterbox-top" id="letterbox-top"></div>
+      <div class="letterbox letterbox-bottom" id="letterbox-bottom"></div>
+
+      <!-- Dynamic Act Banner & End Title -->
+      <div id="act-banner" class="act-banner hidden">
+        <div class="act-eyebrow" id="act-eyebrow">ACT I</div>
+        <div class="act-title" id="act-title">GOLDEN HOUR BREAK</div>
+      </div>
+
+      <!-- Cockpit Radio Subtitle Feed -->
+      <div id="radio-feed" class="radio-feed hidden">
+        <div class="radio-badge">
+          <span class="radio-led"></span>
+          <span id="radio-callsign">VIPER-1 · UHF 243.0</span>
+        </div>
+        <div class="radio-text" id="radio-text"></div>
+      </div>
+
+      <!-- Pre-Launch Title Overlay -->
+      <div id="launch-overlay" class="launch-overlay">
+        <div class="launch-card">
+          <div class="launch-kicker">THREE.JS CINEMATIC AERIAL SHOWCASE · 88 SECONDS</div>
+          <h1 class="launch-title">
+            <span class="title-solar">SOLAR MACH</span>
+            <span class="title-sub">CHROMATIC VIPER</span>
+          </h1>
+          <p class="launch-tagline">
+            Michael Bay pyrotechnics. Ridley Scott scale. 1986 afterburners. Full chromatic overdrive.
+          </p>
+          <div class="launch-actions">
+            <button id="btn-launch" class="btn-engage">
+              <span class="btn-glow"></span>
+              <span class="btn-label">ENGAGE AFTERBURNERS</span>
+            </button>
+          </div>
+          <div class="launch-status" id="launch-status">Initialising PBR shaders &amp; audio engine...</div>
+          <div class="launch-hints">
+            <span><strong>SPACE</strong> Play/Pause</span>
+            <span><strong>1–5</strong> Cameras</span>
+            <span><strong>H</strong> HUD</span>
+            <span><strong>L</strong> LSD Overdrive</span>
+            <span><strong>M</strong> Mute</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Replay / End Card Overlay -->
+      <div id="finale-overlay" class="finale-overlay hidden">
+        <div class="finale-card">
+          <div class="finale-kicker">MISSION COMPLETE · SKIES CLEAR</div>
+          <h2 class="finale-title">SOLAR MACH: CHROMATIC VIPER</h2>
+          <div class="finale-actions">
+            <button id="btn-replay" class="btn-engage">
+              <span class="btn-label">SCRAMBLE AGAIN</span>
+            </button>
+            <button id="btn-freecam" class="btn-secondary">EXPLORE FREE-CAM</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Auto-Hiding Director Control Dock -->
+      <div id="control-dock" class="control-dock hidden">
+        <div class="dock-row">
+          <button id="btn-play" class="dock-btn" title="Play / Pause (Space)">❚❚</button>
+          <button id="btn-restart" class="dock-btn" title="Restart (R)">↺</button>
+          <div class="scrubber-wrap">
+            <span id="time-current" class="time-code">0:00</span>
+            <input id="scrubber" type="range" min="0" max="88" step="0.05" value="0" />
+            <span id="time-total" class="time-code">1:28</span>
+          </div>
+          <button id="btn-mute" class="dock-btn" title="Mute (M)">🔊</button>
+          <button id="btn-hud" class="dock-btn active" title="Toggle HUD (H)">HUD</button>
+        </div>
+
+        <div class="dock-row dock-row-secondary">
+          <div class="cam-group" id="cam-group">
+            <button class="cam-btn active" data-cam="auto">1 AUTO</button>
+            <button class="cam-btn" data-cam="cockpit">2 COCKPIT</button>
+            <button class="cam-btn" data-cam="chase">3 CHASE</button>
+            <button class="cam-btn" data-cam="orbit">4 ORBIT</button>
+            <button class="cam-btn" data-cam="cinematic">5 BAYHEM</button>
+          </div>
+
+          <div class="trip-control">
+            <label for="trip-slider">LSD OVERDRIVE</label>
+            <input id="trip-slider" type="range" min="0" max="1.5" step="0.01" value="1.0" />
+            <span id="trip-value">AUTO</span>
+          </div>
+
+          <div class="perf-readout" id="perf-readout">60 FPS</div>
+        </div>
+      </div>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
