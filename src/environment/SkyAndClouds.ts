@@ -190,10 +190,11 @@ const SKY_CLOUD_FRAG = /* glsl */ `
     skyCol = mix(skyCol, horizon, hFactor);
 
     // Rayleigh/Mie directional horizon glow aligned with the sun azimuth
+    float trip01 = clamp(uTrip, 0.0, 1.0);
     float sunDot = max(dot(dir, sunDir), 0.0);
     float twinDot = max(dot(dir, twinDir), 0.0);
     float horizonSunGlow = pow(max(sunDot, 1e-4), 5.0) * pow(max(invY, 1e-4), 2.8);
-    skyCol += mix(vec3(0.55, 0.24, 0.08), vec3(0.38, 0.10, 0.45), uTrip * 0.6) * horizonSunGlow * 0.62;
+    skyCol += mix(vec3(0.55, 0.24, 0.08), vec3(0.38, 0.10, 0.45), clamp(uTrip * 0.6, 0.0, 1.0)) * horizonSunGlow * 0.62;
 
     // High-altitude stratospheric cirrus wisps
     vec2 skyUv = dir.xz / max(abs(dir.y) + 0.22, 1e-4);
@@ -223,7 +224,7 @@ const SKY_CLOUD_FRAG = /* glsl */ `
 
     // Twin Eclipse Sun: Controlled HDR solar corona + dark eclipse core + diamond prominence
     float mieGlow = pow(max(sunDot, 1e-4), 16.0) * 0.58 + pow(max(sunDot, 1e-4), 110.0) * 1.25;
-    vec3 sunTint = mix(vec3(1.25, 0.66, 0.26), vec3(1.15, 0.34, 0.85), uTrip * 0.55);
+    vec3 sunTint = mix(vec3(1.25, 0.66, 0.26), vec3(1.15, 0.34, 0.85), clamp(uTrip * 0.55, 0.0, 1.0));
     skyCol += sunTint * mieGlow;
 
     float sunDisc = smoothstep(0.9968, 0.9988, sunDot);
@@ -231,15 +232,15 @@ const SKY_CLOUD_FRAG = /* glsl */ `
     float eclipseCore = smoothstep(0.9981, 0.9992, sunDot) * eclipseAmt;
     float coronaRim = smoothstep(0.9960, 0.9984, sunDot) * (1.0 - smoothstep(0.9984, 0.9994, sunDot));
     skyCol += vec3(2.8, 1.9, 1.1) * sunDisc * (1.0 - eclipseCore * 0.92);
-    skyCol += mix(vec3(1.4, 0.60, 0.26), vec3(1.45, 0.32, 1.35), uTrip) * coronaRim * (0.65 + eclipseAmt * 1.85);
+    skyCol += mix(vec3(1.4, 0.60, 0.26), vec3(1.45, 0.32, 1.35), trip01) * coronaRim * (0.65 + eclipseAmt * 1.85);
 
     // Secondary Twin Sun (molten amber companion -> cyan plasma eclipse twin)
     float twinDisc = smoothstep(0.9988, 0.9995, twinDot);
-    vec3 twinTint = mix(vec3(1.05, 0.48, 0.18), vec3(0.32, 0.88, 1.45), uTrip);
+    vec3 twinTint = mix(vec3(1.05, 0.48, 0.18), vec3(0.32, 0.88, 1.45), trip01);
     skyCol += twinTint * (pow(max(twinDot, 1e-4), 84.0) * 0.42 + twinDisc * 1.35);
 
     // ------------------------------------------------------------------
-    // 2. VOLUMETRIC RAYMARCHED CUMULONIMBUS CLOUD CATHEDRAL (26 STEPS <= 28)
+    // 2. VOLUMETRIC RAYMARCHED CUMULONIMBUS CLOUD CATHEDRAL (24 STEPS <= 28)
     // ------------------------------------------------------------------
     vec3 col = skyCol;
     float cloudTransmittance = 1.0;
@@ -281,14 +282,14 @@ const SKY_CLOUD_FRAG = /* glsl */ `
         float phaseTotal = clamp(phasePrimary * 2.3 + phaseTwin * 1.1, 0.14, 3.6);
 
         // Deep dramatic Ridley Scott colour grading: dark brooding undersides + sunlit amber/prism rims
-        vec3 sunLightCol = mix(vec3(1.38, 0.68, 0.28), vec3(0.75, 0.42, 0.82), uStorm * 0.62);
-        sunLightCol = mix(sunLightCol, vec3(1.10, 0.36, 0.98), uTrip * 0.45);
+        vec3 sunLightCol = mix(vec3(1.38, 0.68, 0.28), vec3(0.75, 0.42, 0.82), clamp(uStorm * 0.62, 0.0, 1.0));
+        sunLightCol = mix(sunLightCol, vec3(1.10, 0.36, 0.98), clamp(uTrip * 0.45, 0.0, 1.0));
 
-        vec3 ambientTop = mix(vec3(0.24, 0.36, 0.58), vec3(0.08, 0.14, 0.28), uStorm);
-        vec3 ambientBot = mix(vec3(0.22, 0.11, 0.09), vec3(0.05, 0.03, 0.11), uStorm);
+        vec3 ambientTop = mix(vec3(0.24, 0.36, 0.58), vec3(0.08, 0.14, 0.28), clamp(uStorm, 0.0, 1.0));
+        vec3 ambientBot = mix(vec3(0.22, 0.11, 0.09), vec3(0.05, 0.03, 0.11), clamp(uStorm, 0.0, 1.0));
         if (uTrip > 0.02) {
-          ambientTop = mix(ambientTop, vec3(0.14, 0.44, 0.66), uTrip * 0.55);
-          ambientBot = mix(ambientBot, vec3(0.32, 0.06, 0.36), uTrip * 0.62);
+          ambientTop = mix(ambientTop, vec3(0.14, 0.44, 0.66), clamp(uTrip * 0.55, 0.0, 1.0));
+          ambientBot = mix(ambientBot, vec3(0.32, 0.06, 0.36), clamp(uTrip * 0.62, 0.0, 1.0));
         }
 
         vec3 accumLight = vec3(0.0);
@@ -341,7 +342,7 @@ const SKY_CLOUD_FRAG = /* glsl */ `
               if (uLightning > 0.01) {
                 float strikeDist = length(samplePos - uLightningPos);
                 float strikeAtten = exp(-strikeDist * 0.00082);
-                vec3 boltCol = mix(vec3(0.85, 0.62, 1.65), vec3(0.45, 1.15, 1.75), uTrip * 0.6);
+                vec3 boltCol = mix(vec3(0.85, 0.62, 1.65), vec3(0.45, 1.15, 1.75), clamp(uTrip * 0.6, 0.0, 1.0));
                 lightningGlow = boltCol * uLightning * (0.20 + 2.1 * strikeAtten) * (0.4 + 0.6 * beer);
               }
 
@@ -401,12 +402,12 @@ const SKY_CLOUD_FRAG = /* glsl */ `
     }
 
     // Transient sky flash on lightning & detonations
-    col += mix(vec3(0.55, 0.38, 1.12), vec3(0.38, 0.85, 1.32), uTrip * 0.5) * uLightning * (0.14 + 0.28 * cirrusN);
+    col += mix(vec3(0.55, 0.38, 1.12), vec3(0.38, 0.85, 1.32), clamp(uTrip * 0.5, 0.0, 1.0)) * uLightning * (0.14 + 0.28 * cirrusN);
     col += vec3(1.05, 0.56, 0.24) * uExplosionFlash * 0.32;
 
     // Below-horizon deep ocean-mirror blend
     float below = smoothstep(0.015, -0.075, dir.y);
-    col = mix(col, mix(vec3(0.022, 0.050, 0.095), vec3(0.065, 0.018, 0.125), uTrip), below);
+    col = mix(col, mix(vec3(0.022, 0.050, 0.095), vec3(0.065, 0.018, 0.125), trip01), below);
 
     gl_FragColor = vec4(clamp(col, 0.0, 18.0), 1.0);
   }
@@ -468,7 +469,7 @@ const GODRAY_SHAFT_FRAG = /* glsl */ `
     float mist = 0.78 + 0.22 * sin(vUv.y * 12.0 - uTime * 0.42 + uPhase * 1.7);
 
     float colourBlend = clamp(0.5 + 0.5 * sin(vUv.x * 6.28318 + vUv.y * 3.0 - uTime * 0.45 + uPhase), 0.0, 1.0);
-    vec3 beamCol = mix(uColorPrimary, uColorSecondary, colourBlend * uTrip);
+    vec3 beamCol = max(mix(uColorPrimary, uColorSecondary, clamp(colourBlend * uTrip, 0.0, 1.0)), vec3(0.0));
 
     float alpha = edgeFade * verticalFade * nearFade * curtain * mist * uOpacity;
     gl_FragColor = vec4(beamCol, clamp(alpha, 0.0, 0.42));
@@ -677,25 +678,40 @@ export class SkyAndClouds {
       const ribbonWeight = new Float32Array(vertCount);
       const indices = new Uint16Array(idxCount);
 
-      for (let q = 0; q < totalQuads; q++) {
-        const vOff = q * 4;
-        const iOff = q * 6;
+      // Assign continuous branch-normalised vUv.y across each trunk/fork so interior joints never pinch
+      for (let segIdx = 0; segIdx < TOTAL_RIBBON_SEGMENTS; segIdx++) {
+        let v0: number;
+        let v1: number;
+        if (segIdx < TRUNK_SEGMENTS) {
+          v0 = segIdx / TRUNK_SEGMENTS;
+          v1 = (segIdx + 1) / TRUNK_SEGMENTS;
+        } else {
+          const forkSeg = (segIdx - TRUNK_SEGMENTS) % FORK_SEGMENTS;
+          v0 = forkSeg / FORK_SEGMENTS;
+          v1 = (forkSeg + 1) / FORK_SEGMENTS;
+        }
 
-        ribbonUv[vOff * 2 + 0] = 0;
-        ribbonUv[vOff * 2 + 1] = 0;
-        ribbonUv[(vOff + 1) * 2 + 0] = 1;
-        ribbonUv[(vOff + 1) * 2 + 1] = 0;
-        ribbonUv[(vOff + 2) * 2 + 0] = 0;
-        ribbonUv[(vOff + 2) * 2 + 1] = 1;
-        ribbonUv[(vOff + 3) * 2 + 0] = 1;
-        ribbonUv[(vOff + 3) * 2 + 1] = 1;
+        for (let r = 0; r < RIBBON_QUADS_PER_SEG; r++) {
+          const q = segIdx * RIBBON_QUADS_PER_SEG + r;
+          const vOff = q * 4;
+          const iOff = q * 6;
 
-        indices[iOff + 0] = vOff;
-        indices[iOff + 1] = vOff + 1;
-        indices[iOff + 2] = vOff + 2;
-        indices[iOff + 3] = vOff + 1;
-        indices[iOff + 4] = vOff + 3;
-        indices[iOff + 5] = vOff + 2;
+          ribbonUv[vOff * 2 + 0] = 0;
+          ribbonUv[vOff * 2 + 1] = v0;
+          ribbonUv[(vOff + 1) * 2 + 0] = 1;
+          ribbonUv[(vOff + 1) * 2 + 1] = v0;
+          ribbonUv[(vOff + 2) * 2 + 0] = 0;
+          ribbonUv[(vOff + 2) * 2 + 1] = v1;
+          ribbonUv[(vOff + 3) * 2 + 0] = 1;
+          ribbonUv[(vOff + 3) * 2 + 1] = v1;
+
+          indices[iOff + 0] = vOff;
+          indices[iOff + 1] = vOff + 1;
+          indices[iOff + 2] = vOff + 2;
+          indices[iOff + 3] = vOff + 1;
+          indices[iOff + 4] = vOff + 3;
+          indices[iOff + 5] = vOff + 2;
+        }
       }
 
       ribbonGeo.setAttribute('position', new THREE.BufferAttribute(ribbonPos, 3));

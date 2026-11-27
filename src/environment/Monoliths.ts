@@ -148,8 +148,8 @@ function createBevelledRingGeometry(
       const c = (s + 1) * ringStride + (p + 1);
       const e = s * ringStride + (p + 1);
 
-      indices.push(a, b, e);
-      indices.push(b, c, e);
+      indices.push(a, e, b);
+      indices.push(b, e, c);
     }
   }
 
@@ -183,8 +183,8 @@ function createBevelledShardGeometry(radius: number, halfHeight: number): THREE.
     bx: number, by: number, bz: number, bu: number, bv: number,
     cx: number, cy: number, cz: number, cu: number, cv: number,
   ) => {
-    positions.push(ax, ay, az, bx, by, bz, cx, cy, cz);
-    uvs.push(au, av, bu, bv, cu, cv);
+    positions.push(ax, ay, az, cx, cy, cz, bx, by, bz);
+    uvs.push(au, av, cu, cv, bu, bv);
   };
 
   for (let i = 0; i < sides; i++) {
