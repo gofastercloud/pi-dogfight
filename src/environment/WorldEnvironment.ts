@@ -3,9 +3,13 @@ import { createCloudTexture } from '../aircraft/textures';
 
 const SKY_VERT = /* glsl */ `
   varying vec3 vWorldDir;
+  vec3 safeNormalize(vec3 v) {
+    float len = length(v);
+    return len > 1e-5 ? v / len : vec3(0.0, 1.0, 0.0);
+  }
   void main() {
     vec4 wp = modelMatrix * vec4(position, 1.0);
-    vWorldDir = normalize(position);
+    vWorldDir = safeNormalize(position);
     gl_Position = projectionMatrix * viewMatrix * wp;
   }
 `;
@@ -18,6 +22,11 @@ const SKY_FRAG = /* glsl */ `
   uniform float uTrip;
   uniform float uLightning;
   uniform float uExplosionFlash;
+
+  vec3 safeNormalize(vec3 v) {
+    float len = length(v);
+    return len > 1e-5 ? v / len : vec3(0.0, 1.0, 0.0);
+  }
 
   float hash(vec2 p) {
     return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123);
@@ -53,8 +62,8 @@ const SKY_FRAG = /* glsl */ `
   }
 
   void main() {
-    vec3 dir = normalize(vWorldDir);
-    vec3 sunDir = normalize(uSunDir);
+    vec3 dir = safeNormalize(vWorldDir);
+    vec3 sunDir = safeNormalize(uSunDir);
     float y = max(dir.y, -0.15);
 
     // Base golden-hour Ridley Scott / Top Gun atmospheric gradient
@@ -71,8 +80,9 @@ const SKY_FRAG = /* glsl */ `
     vec3 midCol = mix(goldMid, stormMid, uStorm);
     vec3 horizon = mix(goldHorizon, stormHorizon, uStorm * 0.72);
 
-    float hFactor = pow(1.0 - clamp(y, 0.0, 1.0), 3.6);
-    float midFactor = pow(1.0 - clamp(y, 0.0, 1.0), 1.4);
+    float invY = 1.0 - clamp(y, 0.0, 1.0);
+    float hFactor = pow(max(invY, 1e-4), 3.6);
+    float midFactor = pow(max(invY, 1e-4), 1.4);
     vec3 col = mix(zenith, midCol, midFactor);
     col = mix(col, horizon, hFactor);
 
@@ -85,23 +95,26 @@ const SKY_FRAG = /* glsl */ `
 
     // LSD Chromatic Supercell Aurora & Fractal Nebula
     if (uTrip > 0.01) {
-      float angle = atan(dir.z, dir.x);
+      float safeX = (abs(dir.x) < 1e-5 && abs(dir.z) < 1e-5) ? 1e-5 : dir.x;
+      float angle = atan(dir.z, safeX);
       float warp = fbm(skyUv * 1.45 + vec2(sin(uTime * 0.25), cos(uTime * 0.22)) * 1.6);
-      float ribbon = pow(max(0.0, sin(angle * 4.0 + warp * 8.5 - uTime * 0.9) * 0.5 + 0.5), 3.0);
+      float ribbon = pow(max(sin(angle * 4.0 + warp * 8.5 - uTime * 0.9) * 0.5 + 0.5, 1e-4), 3.0);
       vec3 acidCol = hsv2rgb(vec3(fract(warp * 1.3 + angle * 0.16 - uTime * 0.12), 0.88, 1.0));
       float upperMask = smoothstep(-0.02, 0.45, dir.y);
       col += acidCol * ribbon * upperMask * uTrip * 0.95;
 
       // Subtle prismatic ring halo around the eclipse sun
-      float sunAngle = acos(clamp(dot(dir, sunDir), -1.0, 1.0));
-      float haloRing = exp(-pow((sunAngle - 0.32) * 14.0, 2.0)) + exp(-pow((sunAngle - 0.52) * 18.0, 2.0)) * 0.65;
+      float sunAngle = acos(clamp(dot(dir, sunDir), -0.9999, 0.9999));
+      float d1 = (sunAngle - 0.32) * 14.0;
+      float d2 = (sunAngle - 0.52) * 18.0;
+      float haloRing = exp(-(d1 * d1)) + exp(-(d2 * d2)) * 0.65;
       vec3 haloPrism = hsv2rgb(vec3(fract(sunAngle * 5.0 - uTime * 0.35), 0.92, 1.0));
       col += haloPrism * haloRing * uTrip * 1.35;
     }
 
     // Twin Eclipse Sun + Anamorphic Mie Glow
     float sunDot = max(dot(dir, sunDir), 0.0);
-    float mieGlow = pow(sunDot, 12.0) * 0.95 + pow(sunDot, 96.0) * 1.8;
+    float mieGlow = pow(max(sunDot, 1e-4), 12.0) * 0.95 + pow(max(sunDot, 1e-4), 96.0) * 1.8;
     vec3 sunTint = mix(vec3(1.4, 0.78, 0.34), vec3(1.45, 0.45, 0.95), uTrip * 0.55);
     col += sunTint * mieGlow;
 
@@ -111,10 +124,10 @@ const SKY_FRAG = /* glsl */ `
     col += vec3(3.6, 2.5, 1.5) * sunDisc * (1.0 - eclipseCore * 0.82);
 
     // Ghost twin secondary sun offset slightly
-    vec3 twinDir = normalize(sunDir + vec3(0.11, 0.06, -0.05));
+    vec3 twinDir = safeNormalize(sunDir + vec3(0.11, 0.06, -0.05));
     float twinDot = max(dot(dir, twinDir), 0.0);
     float twinDisc = smoothstep(0.9988, 0.9995, twinDot);
-    col += mix(vec3(1.2, 0.55, 0.25), vec3(0.45, 0.95, 1.6), uTrip) * (pow(twinDot, 80.0) * 0.55 + twinDisc * 1.6);
+    col += mix(vec3(1.2, 0.55, 0.25), vec3(0.45, 0.95, 1.6), uTrip) * (pow(max(twinDot, 1e-4), 80.0) * 0.55 + twinDisc * 1.6);
 
     // Storm lightning & explosion sky bounce
     col += vec3(0.75, 0.48, 1.35) * uLightning * (0.35 + 0.65 * cloudN);
@@ -149,7 +162,8 @@ const OCEAN_VERT = /* glsl */ `
 
     // Expanding aerial detonation shockwave ring on the water surface
     float distShock = length(wp.xz - uShockOrigin.xz);
-    float ringBand = exp(-pow((distShock - uShockRadius) * 0.014, 2.0)) * uShockStrength;
+    float shockDelta = (distShock - uShockRadius) * 0.014;
+    float ringBand = exp(-(shockDelta * shockDelta)) * uShockStrength;
     h += ringBand * 16.0 * sin((distShock - uShockRadius) * 0.09);
 
     wp.y += h;
@@ -171,6 +185,11 @@ const OCEAN_FRAG = /* glsl */ `
   varying vec3 vWorldPos;
   varying float vWaveHeight;
   varying float vShockWave;
+
+  vec3 safeNormalize(vec3 v) {
+    float len = length(v);
+    return len > 1e-5 ? v / len : vec3(0.0, 1.0, 0.0);
+  }
 
   float hash(vec2 p) {
     return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
@@ -194,8 +213,8 @@ const OCEAN_FRAG = /* glsl */ `
   }
 
   void main() {
-    vec3 V = normalize(cameraPosition - vWorldPos);
-    vec3 L = normalize(uSunDir);
+    vec3 V = safeNormalize(cameraPosition - vWorldPos);
+    vec3 L = safeNormalize(uSunDir);
 
     // High-frequency ocean normal ripples
     vec2 uv1 = vWorldPos.xz * 0.032 + vec2(uTime * 0.45, -uTime * 0.32);
@@ -204,13 +223,13 @@ const OCEAN_FRAG = /* glsl */ `
     float n2 = noise(uv2);
     float n3 = noise(vWorldPos.xz * 0.22 + uTime * 0.9);
 
-    vec3 N = normalize(vec3(
+    vec3 N = safeNormalize(vec3(
       (n1 - 0.5) * 0.42 + (n2 - 0.5) * 0.26 + (n3 - 0.5) * 0.14,
       1.0,
       (n2 - 0.5) * 0.42 - (n1 - 0.5) * 0.26 + (n3 - 0.5) * 0.14
     ));
 
-    float fresnel = pow(1.0 - max(dot(N, V), 0.0), 4.2);
+    float fresnel = pow(max(1.0 - max(dot(N, V), 0.0), 1e-4), 4.2);
 
     // Deep Pacific teal -> dark storm slate
     vec3 deepCol = mix(vec3(0.015, 0.055, 0.095), vec3(0.015, 0.025, 0.065), uStorm);
@@ -227,9 +246,10 @@ const OCEAN_FRAG = /* glsl */ `
     vec3 col = mix(deepCol, skyReflect, clamp(0.12 + fresnel * 0.88, 0.0, 1.0));
 
     // Blinding sunset specular glitter highway
-    vec3 H = normalize(L + V);
-    float specBroad = pow(max(dot(N, H), 0.0), 42.0) * 0.85;
-    float specSharp = pow(max(dot(N, H), 0.0), 420.0) * 4.5;
+    vec3 H = safeNormalize(L + V);
+    float ndoth = max(dot(N, H), 1e-4);
+    float specBroad = pow(max(ndoth, 1e-4), 42.0) * 0.85;
+    float specSharp = pow(max(ndoth, 1e-4), 420.0) * 4.5;
     vec3 specCol = mix(vec3(1.5, 0.85, 0.38), vec3(1.4, 0.6, 1.5), uTrip * 0.6);
     col += specCol * (specBroad + specSharp);
 
@@ -268,10 +288,10 @@ const GODRAY_FRAG = /* glsl */ `
   uniform float uOpacity;
   uniform vec3 uColor;
   void main() {
-    float xFade = sin(vUv.x * 3.14159);
-    float yFade = pow(vUv.y, 0.85) * smoothstep(1.0, 0.18, vUv.y);
+    float xFade = max(sin(vUv.x * 3.14159), 0.0);
+    float yFade = pow(max(vUv.y, 1e-4), 0.85) * smoothstep(1.0, 0.18, vUv.y);
     float shimmer = 0.78 + 0.22 * sin(vUv.x * 16.0 + uTime * 0.8);
-    float a = pow(xFade, 2.2) * yFade * shimmer * uOpacity;
+    float a = pow(max(xFade, 1e-4), 2.2) * yFade * shimmer * uOpacity;
     gl_FragColor = vec4(uColor, a);
   }
 `;
@@ -299,6 +319,10 @@ export class WorldEnvironment {
   private shockOrigin = new THREE.Vector3();
   private shockRadius = 9999;
   private shockStrength = 0;
+  private readonly _rayCol = new THREE.Color();
+  private readonly _stormTint = new THREE.Color(0x3a2b52);
+  private readonly _acidTint = new THREE.Color();
+  private readonly _flashTint = new THREE.Color(0xffd0a0);
 
   constructor(scene: THREE.Scene, renderer: THREE.WebGLRenderer) {
     scene.add(this.group);
@@ -736,7 +760,7 @@ export class WorldEnvironment {
     this.lightningLight.intensity = this.lightningFlash * 7.5;
 
     // God rays tint & pulse
-    const rayCol = new THREE.Color().setHSL(
+    this._rayCol.setHSL(
       (0.08 + tripIntensity * 0.72 * (0.5 + 0.5 * Math.sin(time * 0.35))) % 1.0,
       0.92,
       0.62,
@@ -745,24 +769,21 @@ export class WorldEnvironment {
       const m = this.godRayMats[i];
       m.uniforms.uTime.value = time + i * 0.7;
       m.uniforms.uOpacity.value = (0.13 + tripIntensity * 0.08) * (1.0 - stormIntensity * 0.35);
-      m.uniforms.uColor.value.copy(rayCol);
+      m.uniforms.uColor.value.copy(this._rayCol);
     }
 
     // Cloud tint modulation (backlit sunset -> storm purple -> acid iridescent)
-    const stormTint = new THREE.Color(0x3a2b52);
-    const acidTint = new THREE.Color().setHSL((time * 0.08) % 1.0, 0.88, 0.58);
-    const flashTint = new THREE.Color(0xffd0a0);
     for (let i = 0; i < this.cloudSprites.length; i++) {
       const c = this.cloudSprites[i];
       const mat = c.sprite.material as THREE.SpriteMaterial;
-      mat.color.copy(c.baseColor).lerp(stormTint, stormIntensity * 0.72);
+      mat.color.copy(c.baseColor).lerp(this._stormTint, stormIntensity * 0.72);
       if (tripIntensity > 0.05) {
         const hue = (0.78 + (i % 9) * 0.055 + time * 0.06) % 1.0;
-        acidTint.setHSL(hue, 0.86, 0.56);
-        mat.color.lerp(acidTint, tripIntensity * (c.layer === 1 ? 0.72 : 0.45));
+        this._acidTint.setHSL(hue, 0.86, 0.56);
+        mat.color.lerp(this._acidTint, tripIntensity * (c.layer === 1 ? 0.72 : 0.45));
       }
       if (this.lightningFlash > 0.05 || explosionFlash > 0.05) {
-        mat.color.lerp(flashTint, Math.min(0.8, this.lightningFlash * 0.6 + explosionFlash * 0.5));
+        mat.color.lerp(this._flashTint, Math.min(0.8, this.lightningFlash * 0.6 + explosionFlash * 0.5));
       }
     }
 

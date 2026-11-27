@@ -157,7 +157,11 @@ export class FighterHUD {
     ctx.fillText(`ALT  ${altFt.toLocaleString()} FT`, rightX, cy - 42);
     ctx.fillText(`WPN  ${isMissileLocked ? 'AIM-9X PRISM' : 'M61A1 VULCAN'}`, rightX, cy - 24);
     ctx.fillStyle = alert;
-    ctx.fillText(isMissileLocked ? 'LOCK: SHOOT' : `CAM: ${cameraTag}`, rightX, cy - 6);
+    ctx.fillText(`CAM: ${cameraTag}`, rightX, cy - 6);
+    if (isMissileLocked) {
+      ctx.fillStyle = 'rgba(255, 58, 92, 0.95)';
+      ctx.fillText('LOCK: SHOOT', rightX, cy + 30);
+    }
     if (tripIntensity > 0.2) {
       ctx.fillStyle = '#ff7ae5';
       ctx.fillText(`FLUX ${Math.round(tripIntensity * 100)}%`, rightX, cy + 12);
