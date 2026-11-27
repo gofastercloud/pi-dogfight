@@ -1,0 +1,16 @@
+import { defineConfig } from 'vite';
+
+export default defineConfig({
+  base: './',
+  build: {
+    target: 'es2022',
+    outDir: 'dist',
+    assetsInlineLimit: 0,
+    sourcemap: false,
+    chunkSizeWarningLimit: 1200,
+  },
+  server: {
+    host: '0.0.0.0',
+    port: 8080,
+  },
+});
