@@ -178,9 +178,12 @@ export class VolumetricRibbon {
   private readonly spine: Float32Array;
   private readonly posArray: Float32Array;
   private readonly progArray: Float32Array;
+  private readonly geometry: THREE.BufferGeometry;
   private readonly posAttr: THREE.BufferAttribute;
   private readonly progAttr: THREE.BufferAttribute;
   private readonly baseColor = new THREE.Color(0xf6f0e8);
+  private lastUploadedCount = -1;
+  private hasUploadedGeometry = false;
 
   constructor(maxPoints: number, style: RibbonStyle, sunDir: THREE.Vector3) {
     this.maxPoints = maxPoints;
@@ -209,6 +212,7 @@ export class VolumetricRibbon {
     }
 
     const geo = new THREE.BufferGeometry();
+    this.geometry = geo;
     this.posAttr = new THREE.BufferAttribute(this.posArray, 3);
     this.posAttr.setUsage(THREE.DynamicDrawUsage);
     this.progAttr = new THREE.BufferAttribute(this.progArray, 1);
@@ -218,6 +222,7 @@ export class VolumetricRibbon {
     geo.setAttribute('aEdge', new THREE.BufferAttribute(edgeArray, 1));
     geo.setAttribute('aProgress', this.progAttr);
     geo.setIndex(new THREE.BufferAttribute(indices, 1));
+    geo.setDrawRange(0, 0);
 
     this.material = new THREE.ShaderMaterial({
       vertexShader: RIBBON_VERT,
@@ -263,6 +268,9 @@ export class VolumetricRibbon {
     this.fadeAge = 0;
     this.fadeDuration = 1.0;
     this.count = 0;
+    this.lastUploadedCount = -1;
+    this.hasUploadedGeometry = false;
+    this.geometry.setDrawRange(0, 0);
     this.mesh.visible = false;
 
     this.baseColor.setHex(colorHex);
@@ -299,6 +307,9 @@ export class VolumetricRibbon {
     this.active = false;
     this.detached = false;
     this.fadeAge = 0;
+    this.lastUploadedCount = -1;
+    this.hasUploadedGeometry = false;
+    this.geometry.setDrawRange(0, 0);
     this.mesh.visible = false;
     this.material.uniforms.uFade.value = 1.0;
   }
@@ -308,6 +319,9 @@ export class VolumetricRibbon {
     this.active = true;
     this.detached = false;
     this.fadeAge = 0;
+    this.lastUploadedCount = -1;
+    this.hasUploadedGeometry = false;
+    this.geometry.setDrawRange(0, 0);
     this.mesh.visible = false;
     this.material.uniforms.uFade.value = 1.0;
   }
@@ -375,20 +389,31 @@ export class VolumetricRibbon {
   /**
    * Rebuilds smooth, twist-free camera-facing quad strip vertices using
    * parallel-transported side continuity across grazing/head-on view rays.
+   * Skips GPU attribute uploads when inactive or paused (simDt === 0) and
+   * uploads only the active vertex slice via BufferAttribute.addUpdateRange().
    */
-  public rebuildGeometry(camPos: THREE.Vector3): void {
-    if (this.count < 2) {
+  public rebuildGeometry(camPos: THREE.Vector3, simDt = 1): void {
+    if (!this.active || this.count < 2) {
       this.mesh.visible = false;
+      this.geometry.setDrawRange(0, 0);
       return;
     }
+
+    // When simulation is paused (simDt === 0) and geometry was already uploaded,
+    // keep the ribbon visible with zero redundant GPU buffer uploads.
+    if (simDt <= 0 && this.hasUploadedGeometry) {
+      this.mesh.visible = true;
+      return;
+    }
+
     this.mesh.visible = true;
 
     const s = this.spine;
     const pos = this.posArray;
     const prog = this.progArray;
     const count = this.count;
-    const maxPts = this.maxPoints;
     const invSpan = 1 / Math.max(1, count - 1);
+    const updateProg = count !== this.lastUploadedCount;
     const camX = camPos.x;
     const camY = camPos.y;
     const camZ = camPos.z;
@@ -402,29 +427,15 @@ export class VolumetricRibbon {
     let lastDirY = 0;
     let lastDirZ = 1;
 
-    for (let i = 0; i < maxPts; i++) {
-      const clampedIdx = i < count ? i : count - 1;
-      const pOff = clampedIdx * 3;
+    for (let i = 0; i < count; i++) {
+      const pOff = i * 3;
       const px = s[pOff];
       const py = s[pOff + 1];
       const pz = s[pOff + 2];
 
-      if (i >= count) {
-        const vOff = i * 6;
-        pos[vOff] = px;
-        pos[vOff + 1] = py;
-        pos[vOff + 2] = pz;
-        pos[vOff + 3] = px;
-        pos[vOff + 4] = py;
-        pos[vOff + 5] = pz;
-        prog[i * 2] = 1;
-        prog[i * 2 + 1] = 1;
-        continue;
-      }
-
       // Central-difference tangent along ribbon spine
-      const prevIdx = clampedIdx > 0 ? clampedIdx - 1 : 0;
-      const nextIdx = clampedIdx < count - 1 ? clampedIdx + 1 : count - 1;
+      const prevIdx = i > 0 ? i - 1 : 0;
+      const nextIdx = i < count - 1 ? i + 1 : count - 1;
       let dx = s[nextIdx * 3] - s[prevIdx * 3];
       let dy = s[nextIdx * 3 + 1] - s[prevIdx * 3 + 1];
       let dz = s[nextIdx * 3 + 2] - s[prevIdx * 3 + 2];
@@ -548,7 +559,7 @@ export class VolumetricRibbon {
       prevSideY = sideY;
       prevSideZ = sideZ;
 
-      const t = clampedIdx * invSpan;
+      const t = i * invSpan;
       let widthMult: number;
       if (this.style === 'missile') {
         // Tight bright rocket core expanding smoothly into thick billowing wake
@@ -571,12 +582,26 @@ export class VolumetricRibbon {
       pos[vOff + 4] = py - sideY * halfW;
       pos[vOff + 5] = pz - sideZ * halfW;
 
-      prog[i * 2] = t;
-      prog[i * 2 + 1] = t;
+      if (updateProg) {
+        prog[i * 2] = t;
+        prog[i * 2 + 1] = t;
+      }
     }
 
+    const activeVerts = count * 2;
+    this.geometry.setDrawRange(0, (count - 1) * 6);
+
+    this.posAttr.clearUpdateRanges();
+    this.posAttr.addUpdateRange(0, activeVerts * 3);
     this.posAttr.needsUpdate = true;
-    this.progAttr.needsUpdate = true;
+
+    if (updateProg) {
+      this.progAttr.clearUpdateRanges();
+      this.progAttr.addUpdateRange(0, activeVerts);
+      this.progAttr.needsUpdate = true;
+      this.lastUploadedCount = count;
+    }
+    this.hasUploadedGeometry = true;
   }
 
   public getSpinePointCount(): number {
@@ -689,20 +714,22 @@ export class MissileTrailSystem {
     tripIntensity: number,
   ): void {
     const safeDt = Math.max(0, Math.min(dt, 0.05));
+    const isAdvancing = safeDt > 0;
 
     // Update contrail shader uniforms & fade out any detached contrails from downed jets
     for (let i = 0; i < this.contrailRibbons.length; i++) {
       const r = this.contrailRibbons[i];
+      if (!r.active) continue;
       r.material.uniforms.uTime.value = time;
       r.material.uniforms.uTrip.value = tripIntensity;
-      if (r.detached) {
+      if (r.detached && isAdvancing) {
         r.fadeAge += safeDt;
         const fade = Math.max(0, 1 - r.fadeAge / r.fadeDuration);
         r.material.uniforms.uFade.value = fade;
         if (fade <= 0.005) {
           r.reset();
         } else {
-          r.rebuildGeometry(camPos);
+          r.rebuildGeometry(camPos, safeDt);
         }
       }
     }
@@ -713,14 +740,14 @@ export class MissileTrailSystem {
       if (!r.active) continue;
       r.material.uniforms.uTime.value = time;
       r.material.uniforms.uTrip.value = tripIntensity;
-      if (r.detached) {
+      if (r.detached && isAdvancing) {
         r.fadeAge += safeDt;
         const fade = Math.max(0, 1 - r.fadeAge / r.fadeDuration);
         r.material.uniforms.uFade.value = fade;
         if (fade <= 0.005) {
           r.reset();
         } else {
-          r.rebuildGeometry(camPos);
+          r.rebuildGeometry(camPos, safeDt);
         }
       }
     }
@@ -731,14 +758,14 @@ export class MissileTrailSystem {
       if (!r.active) continue;
       r.material.uniforms.uTime.value = time;
       r.material.uniforms.uTrip.value = tripIntensity;
-      if (r.detached) {
+      if (r.detached && isAdvancing) {
         r.fadeAge += safeDt;
         const fade = Math.max(0, 1 - r.fadeAge / r.fadeDuration);
         r.material.uniforms.uFade.value = fade;
         if (fade <= 0.005) {
           r.reset();
         } else {
-          r.rebuildGeometry(camPos);
+          r.rebuildGeometry(camPos, safeDt);
         }
       }
     }

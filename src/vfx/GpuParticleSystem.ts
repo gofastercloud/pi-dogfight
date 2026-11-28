@@ -6,9 +6,40 @@ export const DEBRIS_CAPACITY = 360;
 
 const DEFAULT_SUN_DIR = new THREE.Vector3(-0.35, 0.18, -0.92).normalize();
 
+const KINEMATIC_HELPERS_GLSL = /* glsl */ `
+  // Exact closed-form integral for exponential aerodynamic drag with constant acceleration:
+  //   dv/dt = -k * v + a
+  //   v(t)  = v0 * exp(-k * t) + a * dragLinear(k, t)
+  //   p(t)  = p0 + v0 * dragLinear(k, t) + a * dragQuad(k, t)
+  // Smoothly reduces to pos0 + vel0 * t + 0.5 * a * t^2 as drag k -> 0.
+  float dragLinear(float k, float t) {
+    float u = max(k, 0.0) * t;
+    if (u < 1e-3) {
+      return t * (1.0 - 0.5 * u + u * u * 0.16666667);
+    }
+    return (1.0 - exp(-u)) / max(k, 1e-5);
+  }
+
+  float dragQuad(float k, float t) {
+    float u = max(k, 0.0) * t;
+    if (u < 1e-3) {
+      return 0.5 * t * t * (1.0 - u * 0.33333333 + u * u * 0.08333333);
+    }
+    float invK = 1.0 / max(k, 1e-5);
+    return (u - (1.0 - exp(-u))) * invK * invK;
+  }
+`;
+
 const PUFF_VERT = /* glsl */ `
-  attribute vec4 aPosScale;
-  attribute vec4 aMeta;
+  uniform float uSimTime;
+
+  attribute vec3 aSpawnPos;
+  attribute vec3 aSpawnVel;
+  attribute float aSpawnTime;
+  attribute float aLife;
+  attribute float aSeed;
+  attribute vec4 aPuffKinematics; // x: drag, y: buoyancy, z: initAngle, w: spin
+  attribute vec4 aPuffScaleTemp;  // x: startScale, y: endScale, z: startTemp, w: endTemp
   attribute vec4 aColorAlpha;
 
   varying vec2 vLocalPos;
@@ -24,8 +55,14 @@ const PUFF_VERT = /* glsl */ `
     return len > 1e-5 ? v / len : vec3(0.0, 0.0, 1.0);
   }
 
+  ${KINEMATIC_HELPERS_GLSL}
+
   void main() {
-    if (aPosScale.w <= 1e-4 || aMeta.x >= 1.0 || aColorAlpha.a <= 1e-4) {
+    float age = uSimTime - aSpawnTime;
+    float life = max(aLife, 1e-4);
+    float lifeT = age / life;
+
+    if (age < 0.0 || lifeT >= 1.0 || aLife <= 1e-4 || aColorAlpha.a <= 1e-4) {
       gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
       vLocalPos = vec2(2.0);
       vWorldCenter = vec3(0.0);
@@ -37,20 +74,45 @@ const PUFF_VERT = /* glsl */ `
       return;
     }
 
+    float invT = 1.0 - lifeT;
+    float expand = 1.0 - invT * invT;
+    float scale = mix(aPuffScaleTemp.x, aPuffScaleTemp.y, expand);
+    if (scale <= 1e-4) {
+      gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+      vLocalPos = vec2(2.0);
+      vWorldCenter = vec3(0.0);
+      vMeta = vec4(1.0, 0.0, 0.0, 0.0);
+      vColorAlpha = vec4(0.0);
+      vCamRight = vec3(1.0, 0.0, 0.0);
+      vCamUp = vec3(0.0, 1.0, 0.0);
+      vCamForward = vec3(0.0, 0.0, 1.0);
+      return;
+    }
+
+    float drag = aPuffKinematics.x;
+    float buoyancy = aPuffKinematics.y;
+    float dLin = dragLinear(drag, age);
+    float dQuad = dragQuad(drag, age);
+    vec3 center = aSpawnPos + aSpawnVel * dLin + vec3(0.0, buoyancy * dQuad, 0.0);
+
+    float cool = 1.0 - invT * invT * invT;
+    float temp = mix(aPuffScaleTemp.z, aPuffScaleTemp.w, cool);
+    float angle = aPuffKinematics.z + aPuffKinematics.w * age;
+
     vec3 camRight = vec3(viewMatrix[0][0], viewMatrix[1][0], viewMatrix[2][0]);
     vec3 camUp = vec3(viewMatrix[0][1], viewMatrix[1][1], viewMatrix[2][1]);
-    vec3 camForward = safeNormalize(cameraPosition - aPosScale.xyz);
+    vec3 camForward = safeNormalize(cameraPosition - center);
 
-    float c = cos(aMeta.z);
-    float s = sin(aMeta.z);
+    float c = cos(angle);
+    float s = sin(angle);
     vec3 rotRight = camRight * c + camUp * s;
     vec3 rotUp = -camRight * s + camUp * c;
 
-    vec3 worldPos = aPosScale.xyz + (rotRight * position.x + rotUp * position.y) * aPosScale.w;
+    vec3 worldPos = center + (rotRight * position.x + rotUp * position.y) * scale;
 
     vLocalPos = position.xy * 2.0;
-    vWorldCenter = aPosScale.xyz;
-    vMeta = aMeta;
+    vWorldCenter = center;
+    vMeta = vec4(lifeT, temp, angle, aSeed);
     vColorAlpha = aColorAlpha;
     vCamRight = rotRight;
     vCamUp = rotUp;
@@ -206,8 +268,14 @@ const PUFF_FRAG = /* glsl */ `
 `;
 
 const SPARK_VERT = /* glsl */ `
-  attribute vec4 aPosSize;
-  attribute vec4 aVelLife;
+  uniform float uSimTime;
+
+  attribute vec3 aSpawnPos;
+  attribute vec3 aSpawnVel;
+  attribute float aSpawnTime;
+  attribute float aLife;
+  attribute float aSeed;
+  attribute vec3 aSparkParams; // x: baseSize, y: drag, z: gravity
   attribute vec4 aColorHeat;
 
   varying vec2 vUv;
@@ -219,9 +287,15 @@ const SPARK_VERT = /* glsl */ `
     return len > 1e-5 ? v / len : vec3(0.0, 1.0, 0.0);
   }
 
+  ${KINEMATIC_HELPERS_GLSL}
+
   void main() {
-    float lifeT = aVelLife.w;
-    if (aPosSize.w <= 1e-4 || lifeT >= 1.0) {
+    float age = uSimTime - aSpawnTime;
+    float life = max(aLife, 1e-4);
+    float lifeT = age / life;
+    float baseSize = aSparkParams.x;
+
+    if (age < 0.0 || lifeT >= 1.0 || aLife <= 1e-4 || baseSize <= 1e-4) {
       gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
       vUv = vec2(0.0);
       vColorHeat = vec4(0.0);
@@ -229,10 +303,18 @@ const SPARK_VERT = /* glsl */ `
       return;
     }
 
-    vec3 vel = aVelLife.xyz;
+    float drag = aSparkParams.y;
+    float gravity = aSparkParams.z;
+    float dLin = dragLinear(drag, age);
+    float dQuad = dragQuad(drag, age);
+    float expDrag = exp(-max(drag, 0.0) * age);
+
+    vec3 center = aSpawnPos + aSpawnVel * dLin + vec3(0.0, -gravity * dQuad, 0.0);
+    vec3 vel = aSpawnVel * expDrag + vec3(0.0, -gravity * dLin, 0.0);
+
     float speed = length(vel);
     vec3 dir = speed > 1e-3 ? vel / speed : vec3(0.0, 1.0, 0.0);
-    vec3 toCam = safeNormalize(cameraPosition - aPosSize.xyz);
+    vec3 toCam = safeNormalize(cameraPosition - center);
 
     vec3 side = cross(dir, toCam);
     if (length(side) < 1e-3) {
@@ -240,11 +322,13 @@ const SPARK_VERT = /* glsl */ `
     }
     side = safeNormalize(side);
 
+    float curSize = baseSize * (1.0 - lifeT * 0.45);
     float fade = 1.0 - clamp(lifeT, 0.0, 1.0);
-    float width = aPosSize.w * (0.42 + 0.58 * fade);
-    float streakLen = max(width * 2.4, aPosSize.w * (2.0 + speed * 0.044) * (0.35 + 0.65 * fade));
+    float shimmer = 0.92 + 0.08 * sin(age * 38.0 + aSeed * 62.8318);
+    float width = curSize * (0.42 + 0.58 * fade) * shimmer;
+    float streakLen = max(width * 2.4, curSize * (2.0 + speed * 0.044) * (0.35 + 0.65 * fade));
 
-    vec3 worldPos = aPosSize.xyz
+    vec3 worldPos = center
       + side * (position.x * width)
       + dir * (position.y * streakLen);
 
@@ -286,9 +370,16 @@ const SPARK_FRAG = /* glsl */ `
 `;
 
 const DEBRIS_VERT = /* glsl */ `
-  attribute vec4 aPosScale;
-  attribute vec4 aQuat;
-  attribute vec4 aHeatLife;
+  uniform float uSimTime;
+
+  attribute vec3 aSpawnPos;
+  attribute vec3 aSpawnVel;
+  attribute float aSpawnTime;
+  attribute float aLife;
+  attribute float aSeed;
+  attribute vec4 aInitQuat;
+  attribute vec3 aAngularVel;
+  attribute vec3 aDebrisMeta; // x: baseScale, y: heat, z: prism
 
   varying vec3 vWorldNormal;
   varying vec3 vWorldPos;
@@ -299,13 +390,27 @@ const DEBRIS_VERT = /* glsl */ `
     return v + 2.0 * cross(q.xyz, cross(q.xyz, v) + q.w * v);
   }
 
+  vec4 quatMul(vec4 a, vec4 b) {
+    return vec4(
+      a.w * b.xyz + b.w * a.xyz + cross(a.xyz, b.xyz),
+      a.w * b.w - dot(a.xyz, b.xyz)
+    );
+  }
+
   vec3 safeNormalize(vec3 v) {
     float len = length(v);
     return len > 1e-5 ? v / len : vec3(0.0, 1.0, 0.0);
   }
 
+  ${KINEMATIC_HELPERS_GLSL}
+
   void main() {
-    if (aPosScale.w <= 1e-4 || aHeatLife.x >= 1.0) {
+    float age = uSimTime - aSpawnTime;
+    float life = max(aLife, 1e-4);
+    float lifeT = age / life;
+    float baseScale = aDebrisMeta.x;
+
+    if (age < 0.0 || lifeT >= 1.0 || aLife <= 1e-4 || baseScale <= 1e-4) {
       gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
       vWorldNormal = vec3(0.0, 1.0, 0.0);
       vWorldPos = vec3(0.0);
@@ -314,14 +419,32 @@ const DEBRIS_VERT = /* glsl */ `
       return;
     }
 
-    vec3 scaledPos = position * aPosScale.w;
-    vec3 worldPos = aPosScale.xyz + rotateQuat(aQuat, scaledPos);
-    vec3 worldN = safeNormalize(rotateQuat(aQuat, normal));
+    // Ballistic trajectory with exponential aerodynamic drag (k = 0.24) and gravity (46 m/s^2)
+    float dLin = dragLinear(0.24, age);
+    float dQuad = dragQuad(0.24, age);
+    vec3 center = aSpawnPos + aSpawnVel * dLin + vec3(0.0, -46.0 * dQuad, 0.0);
+
+    // Exact analytical quaternion spin from constant world-space angular velocity
+    float omega = length(aAngularVel);
+    vec4 q = aInitQuat;
+    if (omega > 1e-5) {
+      vec3 axis = aAngularVel / omega;
+      float halfAngle = 0.5 * omega * age;
+      vec4 qDelta = vec4(axis * sin(halfAngle), cos(halfAngle));
+      q = quatMul(qDelta, aInitQuat);
+    }
+    float qLen = length(q);
+    q = qLen > 1e-5 ? q / qLen : vec4(0.0, 0.0, 0.0, 1.0);
+
+    float curScale = baseScale * (1.0 - lifeT * 0.48);
+    vec3 scaledPos = position * curScale;
+    vec3 worldPos = center + rotateQuat(q, scaledPos);
+    vec3 worldN = safeNormalize(rotateQuat(q, normal));
 
     vWorldPos = worldPos;
     vWorldNormal = worldN;
     vLocalPos = position;
-    vHeatLife = aHeatLife;
+    vHeatLife = vec4(lifeT, aDebrisMeta.y, aDebrisMeta.z, aSeed);
 
     gl_Position = projectionMatrix * viewMatrix * vec4(worldPos, 1.0);
   }
@@ -427,12 +550,33 @@ function createDebrisShardInstancedGeometry(): THREE.InstancedBufferGeometry {
   return geo;
 }
 
+function flushAttributeDirtySlice(
+  attr: THREE.InstancedBufferAttribute,
+  dirtyStart: number,
+  dirtyCount: number,
+  capacity: number,
+): void {
+  const itemSize = attr.itemSize;
+  attr.clearUpdateRanges();
+  if (dirtyCount >= capacity) {
+    attr.addUpdateRange(0, capacity * itemSize);
+  } else if (dirtyStart + dirtyCount <= capacity) {
+    attr.addUpdateRange(dirtyStart * itemSize, dirtyCount * itemSize);
+  } else {
+    const tailCount = capacity - dirtyStart;
+    const headCount = dirtyCount - tailCount;
+    attr.addUpdateRange(dirtyStart * itemSize, tailCount * itemSize);
+    attr.addUpdateRange(0, headCount * itemSize);
+  }
+  attr.needsUpdate = true;
+}
+
 /**
- * Zero-GC GPU-instanced particle engine with pre-allocated ring-buffered
- * InstancedBufferGeometry pools:
+ * Zero-GC GPU-kinematic instanced particle engine with write-once spawn buffers
+ * and dirty-slice sub-buffer uploads via BufferAttribute.addUpdateRange():
  *  - 6,400 black-body lit volumetric fireball & smoke puffs
  *  - 4,200 velocity-stretched glowing magnesium sparks
- *  - 360 tumbling flaming fuselage debris chunks trailing volumetric smoke
+ *  - 360 tumbling flaming fuselage debris shards
  */
 export class GpuParticleSystem {
   public readonly group = new THREE.Group();
@@ -456,65 +600,84 @@ export class GpuParticleSystem {
   private readonly sparkMat: THREE.ShaderMaterial;
   private readonly debrisMat: THREE.ShaderMaterial;
 
-  // --- Puff ring-buffer GPU & CPU state ---
-  private readonly puffPosScaleData = new Float32Array(PUFF_CAPACITY * 4);
-  private readonly puffMetaData = new Float32Array(PUFF_CAPACITY * 4);
-  private readonly puffColorAlphaData = new Float32Array(PUFF_CAPACITY * 4);
-  private readonly puffPosScaleAttr: THREE.InstancedBufferAttribute;
-  private readonly puffMetaAttr: THREE.InstancedBufferAttribute;
-  private readonly puffColorAlphaAttr: THREE.InstancedBufferAttribute;
+  // Internal monotonic simulation clock (advances strictly by simDt so pause & slow-mo are exact)
+  private simTime = 0;
 
-  private readonly puffVx = new Float32Array(PUFF_CAPACITY);
-  private readonly puffVy = new Float32Array(PUFF_CAPACITY);
-  private readonly puffVz = new Float32Array(PUFF_CAPACITY);
-  private readonly puffAge = new Float32Array(PUFF_CAPACITY);
-  private readonly puffLife = new Float32Array(PUFF_CAPACITY);
-  private readonly puffStartScale = new Float32Array(PUFF_CAPACITY);
-  private readonly puffEndScale = new Float32Array(PUFF_CAPACITY);
-  private readonly puffStartTemp = new Float32Array(PUFF_CAPACITY);
-  private readonly puffEndTemp = new Float32Array(PUFF_CAPACITY);
-  private readonly puffDrag = new Float32Array(PUFF_CAPACITY);
-  private readonly puffBuoyancy = new Float32Array(PUFF_CAPACITY);
-  private readonly puffSpin = new Float32Array(PUFF_CAPACITY);
+  // --- Puff immutable spawn-time ring-buffer attributes ---
+  private readonly puffSpawnPosData = new Float32Array(PUFF_CAPACITY * 3);
+  private readonly puffSpawnVelData = new Float32Array(PUFF_CAPACITY * 3);
+  private readonly puffSpawnTimeData = new Float32Array(PUFF_CAPACITY);
+  private readonly puffLifeData = new Float32Array(PUFF_CAPACITY);
+  private readonly puffSeedData = new Float32Array(PUFF_CAPACITY);
+  private readonly puffKinematicsData = new Float32Array(PUFF_CAPACITY * 4);
+  private readonly puffScaleTempData = new Float32Array(PUFF_CAPACITY * 4);
+  private readonly puffColorAlphaData = new Float32Array(PUFF_CAPACITY * 4);
+
+  private readonly puffSpawnPosAttr: THREE.InstancedBufferAttribute;
+  private readonly puffSpawnVelAttr: THREE.InstancedBufferAttribute;
+  private readonly puffSpawnTimeAttr: THREE.InstancedBufferAttribute;
+  private readonly puffLifeAttr: THREE.InstancedBufferAttribute;
+  private readonly puffSeedAttr: THREE.InstancedBufferAttribute;
+  private readonly puffKinematicsAttr: THREE.InstancedBufferAttribute;
+  private readonly puffScaleTempAttr: THREE.InstancedBufferAttribute;
+  private readonly puffColorAlphaAttr: THREE.InstancedBufferAttribute;
+  private readonly puffAttrs: readonly THREE.InstancedBufferAttribute[];
+
   private puffCursor = 0;
   private puffHighWater = 0;
+  private puffDirtyStart = 0;
+  private puffDirtyCount = 0;
+  private puffMaxExpiry = 0;
 
-  // --- Spark ring-buffer GPU & CPU state ---
-  private readonly sparkPosSizeData = new Float32Array(SPARK_CAPACITY * 4);
-  private readonly sparkVelLifeData = new Float32Array(SPARK_CAPACITY * 4);
+  // --- Spark immutable spawn-time ring-buffer attributes ---
+  private readonly sparkSpawnPosData = new Float32Array(SPARK_CAPACITY * 3);
+  private readonly sparkSpawnVelData = new Float32Array(SPARK_CAPACITY * 3);
+  private readonly sparkSpawnTimeData = new Float32Array(SPARK_CAPACITY);
+  private readonly sparkLifeData = new Float32Array(SPARK_CAPACITY);
+  private readonly sparkSeedData = new Float32Array(SPARK_CAPACITY);
+  private readonly sparkParamsData = new Float32Array(SPARK_CAPACITY * 3);
   private readonly sparkColorHeatData = new Float32Array(SPARK_CAPACITY * 4);
-  private readonly sparkPosSizeAttr: THREE.InstancedBufferAttribute;
-  private readonly sparkVelLifeAttr: THREE.InstancedBufferAttribute;
-  private readonly sparkColorHeatAttr: THREE.InstancedBufferAttribute;
 
-  private readonly sparkAge = new Float32Array(SPARK_CAPACITY);
-  private readonly sparkLife = new Float32Array(SPARK_CAPACITY);
-  private readonly sparkBaseSize = new Float32Array(SPARK_CAPACITY);
-  private readonly sparkDrag = new Float32Array(SPARK_CAPACITY);
-  private readonly sparkGravity = new Float32Array(SPARK_CAPACITY);
+  private readonly sparkSpawnPosAttr: THREE.InstancedBufferAttribute;
+  private readonly sparkSpawnVelAttr: THREE.InstancedBufferAttribute;
+  private readonly sparkSpawnTimeAttr: THREE.InstancedBufferAttribute;
+  private readonly sparkLifeAttr: THREE.InstancedBufferAttribute;
+  private readonly sparkSeedAttr: THREE.InstancedBufferAttribute;
+  private readonly sparkParamsAttr: THREE.InstancedBufferAttribute;
+  private readonly sparkColorHeatAttr: THREE.InstancedBufferAttribute;
+  private readonly sparkAttrs: readonly THREE.InstancedBufferAttribute[];
+
   private sparkCursor = 0;
   private sparkHighWater = 0;
+  private sparkDirtyStart = 0;
+  private sparkDirtyCount = 0;
+  private sparkMaxExpiry = 0;
 
-  // --- Debris ring-buffer GPU & CPU state ---
-  private readonly debrisPosScaleData = new Float32Array(DEBRIS_CAPACITY * 4);
-  private readonly debrisQuatData = new Float32Array(DEBRIS_CAPACITY * 4);
-  private readonly debrisHeatLifeData = new Float32Array(DEBRIS_CAPACITY * 4);
-  private readonly debrisPosScaleAttr: THREE.InstancedBufferAttribute;
-  private readonly debrisQuatAttr: THREE.InstancedBufferAttribute;
-  private readonly debrisHeatLifeAttr: THREE.InstancedBufferAttribute;
+  // --- Debris immutable spawn-time ring-buffer attributes ---
+  private readonly debrisSpawnPosData = new Float32Array(DEBRIS_CAPACITY * 3);
+  private readonly debrisSpawnVelData = new Float32Array(DEBRIS_CAPACITY * 3);
+  private readonly debrisSpawnTimeData = new Float32Array(DEBRIS_CAPACITY);
+  private readonly debrisLifeData = new Float32Array(DEBRIS_CAPACITY);
+  private readonly debrisSeedData = new Float32Array(DEBRIS_CAPACITY);
+  private readonly debrisInitQuatData = new Float32Array(DEBRIS_CAPACITY * 4);
+  private readonly debrisAngularVelData = new Float32Array(DEBRIS_CAPACITY * 3);
+  private readonly debrisMetaData = new Float32Array(DEBRIS_CAPACITY * 3);
 
-  private readonly debrisVx = new Float32Array(DEBRIS_CAPACITY);
-  private readonly debrisVy = new Float32Array(DEBRIS_CAPACITY);
-  private readonly debrisVz = new Float32Array(DEBRIS_CAPACITY);
-  private readonly debrisWx = new Float32Array(DEBRIS_CAPACITY);
-  private readonly debrisWy = new Float32Array(DEBRIS_CAPACITY);
-  private readonly debrisWz = new Float32Array(DEBRIS_CAPACITY);
-  private readonly debrisAge = new Float32Array(DEBRIS_CAPACITY);
-  private readonly debrisLife = new Float32Array(DEBRIS_CAPACITY);
-  private readonly debrisBaseScale = new Float32Array(DEBRIS_CAPACITY);
-  private readonly debrisSmokeTimer = new Float32Array(DEBRIS_CAPACITY);
+  private readonly debrisSpawnPosAttr: THREE.InstancedBufferAttribute;
+  private readonly debrisSpawnVelAttr: THREE.InstancedBufferAttribute;
+  private readonly debrisSpawnTimeAttr: THREE.InstancedBufferAttribute;
+  private readonly debrisLifeAttr: THREE.InstancedBufferAttribute;
+  private readonly debrisSeedAttr: THREE.InstancedBufferAttribute;
+  private readonly debrisInitQuatAttr: THREE.InstancedBufferAttribute;
+  private readonly debrisAngularVelAttr: THREE.InstancedBufferAttribute;
+  private readonly debrisMetaAttr: THREE.InstancedBufferAttribute;
+  private readonly debrisAttrs: readonly THREE.InstancedBufferAttribute[];
+
   private debrisCursor = 0;
   private debrisHighWater = 0;
+  private debrisDirtyStart = 0;
+  private debrisDirtyCount = 0;
+  private debrisMaxExpiry = 0;
 
   // Shared lighting uniforms
   private readonly sunDir = DEFAULT_SUN_DIR.clone();
@@ -528,14 +691,35 @@ export class GpuParticleSystem {
 
     // 1. Volumetric Fireball & Smoke Puff Pool (6,400 instances)
     this.puffGeo = createUnitQuadInstancedGeometry();
-    this.puffPosScaleAttr = new THREE.InstancedBufferAttribute(this.puffPosScaleData, 4);
-    this.puffPosScaleAttr.setUsage(THREE.DynamicDrawUsage);
-    this.puffMetaAttr = new THREE.InstancedBufferAttribute(this.puffMetaData, 4);
-    this.puffMetaAttr.setUsage(THREE.DynamicDrawUsage);
+    this.puffSpawnPosAttr = new THREE.InstancedBufferAttribute(this.puffSpawnPosData, 3);
+    this.puffSpawnVelAttr = new THREE.InstancedBufferAttribute(this.puffSpawnVelData, 3);
+    this.puffSpawnTimeAttr = new THREE.InstancedBufferAttribute(this.puffSpawnTimeData, 1);
+    this.puffLifeAttr = new THREE.InstancedBufferAttribute(this.puffLifeData, 1);
+    this.puffSeedAttr = new THREE.InstancedBufferAttribute(this.puffSeedData, 1);
+    this.puffKinematicsAttr = new THREE.InstancedBufferAttribute(this.puffKinematicsData, 4);
+    this.puffScaleTempAttr = new THREE.InstancedBufferAttribute(this.puffScaleTempData, 4);
     this.puffColorAlphaAttr = new THREE.InstancedBufferAttribute(this.puffColorAlphaData, 4);
-    this.puffColorAlphaAttr.setUsage(THREE.DynamicDrawUsage);
-    this.puffGeo.setAttribute('aPosScale', this.puffPosScaleAttr);
-    this.puffGeo.setAttribute('aMeta', this.puffMetaAttr);
+    this.puffAttrs = [
+      this.puffSpawnPosAttr,
+      this.puffSpawnVelAttr,
+      this.puffSpawnTimeAttr,
+      this.puffLifeAttr,
+      this.puffSeedAttr,
+      this.puffKinematicsAttr,
+      this.puffScaleTempAttr,
+      this.puffColorAlphaAttr,
+    ];
+    for (let i = 0; i < this.puffAttrs.length; i++) {
+      this.puffAttrs[i].setUsage(THREE.DynamicDrawUsage);
+    }
+
+    this.puffGeo.setAttribute('aSpawnPos', this.puffSpawnPosAttr);
+    this.puffGeo.setAttribute('aSpawnVel', this.puffSpawnVelAttr);
+    this.puffGeo.setAttribute('aSpawnTime', this.puffSpawnTimeAttr);
+    this.puffGeo.setAttribute('aLife', this.puffLifeAttr);
+    this.puffGeo.setAttribute('aSeed', this.puffSeedAttr);
+    this.puffGeo.setAttribute('aPuffKinematics', this.puffKinematicsAttr);
+    this.puffGeo.setAttribute('aPuffScaleTemp', this.puffScaleTempAttr);
     this.puffGeo.setAttribute('aColorAlpha', this.puffColorAlphaAttr);
 
     this.puffMat = new THREE.ShaderMaterial({
@@ -545,6 +729,7 @@ export class GpuParticleSystem {
       depthWrite: false,
       blending: THREE.NormalBlending,
       uniforms: {
+        uSimTime: { value: 0 },
         uTime: { value: 0 },
         uTrip: { value: 0 },
         uSunDir: { value: this.sunDir },
@@ -555,19 +740,38 @@ export class GpuParticleSystem {
     });
     this.puffMesh = new THREE.Mesh(this.puffGeo, this.puffMat);
     this.puffMesh.frustumCulled = false;
+    this.puffMesh.visible = false;
     this.puffMesh.renderOrder = 20;
     this.group.add(this.puffMesh);
 
     // 2. Velocity-Stretched Glowing Spark Pool (4,200 instances)
     this.sparkGeo = createUnitQuadInstancedGeometry();
-    this.sparkPosSizeAttr = new THREE.InstancedBufferAttribute(this.sparkPosSizeData, 4);
-    this.sparkPosSizeAttr.setUsage(THREE.DynamicDrawUsage);
-    this.sparkVelLifeAttr = new THREE.InstancedBufferAttribute(this.sparkVelLifeData, 4);
-    this.sparkVelLifeAttr.setUsage(THREE.DynamicDrawUsage);
+    this.sparkSpawnPosAttr = new THREE.InstancedBufferAttribute(this.sparkSpawnPosData, 3);
+    this.sparkSpawnVelAttr = new THREE.InstancedBufferAttribute(this.sparkSpawnVelData, 3);
+    this.sparkSpawnTimeAttr = new THREE.InstancedBufferAttribute(this.sparkSpawnTimeData, 1);
+    this.sparkLifeAttr = new THREE.InstancedBufferAttribute(this.sparkLifeData, 1);
+    this.sparkSeedAttr = new THREE.InstancedBufferAttribute(this.sparkSeedData, 1);
+    this.sparkParamsAttr = new THREE.InstancedBufferAttribute(this.sparkParamsData, 3);
     this.sparkColorHeatAttr = new THREE.InstancedBufferAttribute(this.sparkColorHeatData, 4);
-    this.sparkColorHeatAttr.setUsage(THREE.DynamicDrawUsage);
-    this.sparkGeo.setAttribute('aPosSize', this.sparkPosSizeAttr);
-    this.sparkGeo.setAttribute('aVelLife', this.sparkVelLifeAttr);
+    this.sparkAttrs = [
+      this.sparkSpawnPosAttr,
+      this.sparkSpawnVelAttr,
+      this.sparkSpawnTimeAttr,
+      this.sparkLifeAttr,
+      this.sparkSeedAttr,
+      this.sparkParamsAttr,
+      this.sparkColorHeatAttr,
+    ];
+    for (let i = 0; i < this.sparkAttrs.length; i++) {
+      this.sparkAttrs[i].setUsage(THREE.DynamicDrawUsage);
+    }
+
+    this.sparkGeo.setAttribute('aSpawnPos', this.sparkSpawnPosAttr);
+    this.sparkGeo.setAttribute('aSpawnVel', this.sparkSpawnVelAttr);
+    this.sparkGeo.setAttribute('aSpawnTime', this.sparkSpawnTimeAttr);
+    this.sparkGeo.setAttribute('aLife', this.sparkLifeAttr);
+    this.sparkGeo.setAttribute('aSeed', this.sparkSeedAttr);
+    this.sparkGeo.setAttribute('aSparkParams', this.sparkParamsAttr);
     this.sparkGeo.setAttribute('aColorHeat', this.sparkColorHeatAttr);
 
     this.sparkMat = new THREE.ShaderMaterial({
@@ -576,23 +780,48 @@ export class GpuParticleSystem {
       transparent: true,
       depthWrite: false,
       blending: THREE.AdditiveBlending,
+      uniforms: {
+        uSimTime: { value: 0 },
+      },
     });
     this.sparkMesh = new THREE.Mesh(this.sparkGeo, this.sparkMat);
     this.sparkMesh.frustumCulled = false;
+    this.sparkMesh.visible = false;
     this.sparkMesh.renderOrder = 24;
     this.group.add(this.sparkMesh);
 
     // 3. Tumbling Flaming Debris Pool (360 instances)
     this.debrisGeo = createDebrisShardInstancedGeometry();
-    this.debrisPosScaleAttr = new THREE.InstancedBufferAttribute(this.debrisPosScaleData, 4);
-    this.debrisPosScaleAttr.setUsage(THREE.DynamicDrawUsage);
-    this.debrisQuatAttr = new THREE.InstancedBufferAttribute(this.debrisQuatData, 4);
-    this.debrisQuatAttr.setUsage(THREE.DynamicDrawUsage);
-    this.debrisHeatLifeAttr = new THREE.InstancedBufferAttribute(this.debrisHeatLifeData, 4);
-    this.debrisHeatLifeAttr.setUsage(THREE.DynamicDrawUsage);
-    this.debrisGeo.setAttribute('aPosScale', this.debrisPosScaleAttr);
-    this.debrisGeo.setAttribute('aQuat', this.debrisQuatAttr);
-    this.debrisGeo.setAttribute('aHeatLife', this.debrisHeatLifeAttr);
+    this.debrisSpawnPosAttr = new THREE.InstancedBufferAttribute(this.debrisSpawnPosData, 3);
+    this.debrisSpawnVelAttr = new THREE.InstancedBufferAttribute(this.debrisSpawnVelData, 3);
+    this.debrisSpawnTimeAttr = new THREE.InstancedBufferAttribute(this.debrisSpawnTimeData, 1);
+    this.debrisLifeAttr = new THREE.InstancedBufferAttribute(this.debrisLifeData, 1);
+    this.debrisSeedAttr = new THREE.InstancedBufferAttribute(this.debrisSeedData, 1);
+    this.debrisInitQuatAttr = new THREE.InstancedBufferAttribute(this.debrisInitQuatData, 4);
+    this.debrisAngularVelAttr = new THREE.InstancedBufferAttribute(this.debrisAngularVelData, 3);
+    this.debrisMetaAttr = new THREE.InstancedBufferAttribute(this.debrisMetaData, 3);
+    this.debrisAttrs = [
+      this.debrisSpawnPosAttr,
+      this.debrisSpawnVelAttr,
+      this.debrisSpawnTimeAttr,
+      this.debrisLifeAttr,
+      this.debrisSeedAttr,
+      this.debrisInitQuatAttr,
+      this.debrisAngularVelAttr,
+      this.debrisMetaAttr,
+    ];
+    for (let i = 0; i < this.debrisAttrs.length; i++) {
+      this.debrisAttrs[i].setUsage(THREE.DynamicDrawUsage);
+    }
+
+    this.debrisGeo.setAttribute('aSpawnPos', this.debrisSpawnPosAttr);
+    this.debrisGeo.setAttribute('aSpawnVel', this.debrisSpawnVelAttr);
+    this.debrisGeo.setAttribute('aSpawnTime', this.debrisSpawnTimeAttr);
+    this.debrisGeo.setAttribute('aLife', this.debrisLifeAttr);
+    this.debrisGeo.setAttribute('aSeed', this.debrisSeedAttr);
+    this.debrisGeo.setAttribute('aInitQuat', this.debrisInitQuatAttr);
+    this.debrisGeo.setAttribute('aAngularVel', this.debrisAngularVelAttr);
+    this.debrisGeo.setAttribute('aDebrisMeta', this.debrisMetaAttr);
 
     this.debrisMat = new THREE.ShaderMaterial({
       vertexShader: DEBRIS_VERT,
@@ -600,6 +829,7 @@ export class GpuParticleSystem {
       transparent: false,
       depthWrite: true,
       uniforms: {
+        uSimTime: { value: 0 },
         uSunDir: { value: this.sunDir },
         uFlashPos: { value: this.flashPos },
         uFlashColor: { value: this.flashColor },
@@ -609,6 +839,7 @@ export class GpuParticleSystem {
     });
     this.debrisMesh = new THREE.Mesh(this.debrisGeo, this.debrisMat);
     this.debrisMesh.frustumCulled = false;
+    this.debrisMesh.visible = false;
     this.debrisMesh.renderOrder = 15;
     this.group.add(this.debrisMesh);
   }
@@ -651,44 +882,56 @@ export class GpuParticleSystem {
     mode = 0,
   ): void {
     const idx = this.puffCursor;
-    this.puffCursor = (this.puffCursor + 1) % PUFF_CAPACITY;
+    if (this.puffDirtyCount === 0) {
+      this.puffDirtyStart = idx;
+    }
+    if (this.puffDirtyCount < PUFF_CAPACITY) {
+      this.puffDirtyCount++;
+    }
+
+    this.puffCursor = (idx + 1) % PUFF_CAPACITY;
     if (idx + 1 > this.puffHighWater) {
       this.puffHighWater = idx + 1;
     }
 
-    const i4 = idx * 4;
-    this.puffPosScaleData[i4] = x;
-    this.puffPosScaleData[i4 + 1] = y;
-    this.puffPosScaleData[i4 + 2] = z;
-    this.puffPosScaleData[i4 + 3] = startScale;
+    const safeLife = Math.max(0.05, life);
+    const expiry = this.simTime + safeLife;
+    if (expiry > this.puffMaxExpiry) {
+      this.puffMaxExpiry = expiry;
+    }
 
-    this.puffMetaData[i4] = 0;
-    this.puffMetaData[i4 + 1] = startTemp;
-    this.puffMetaData[i4 + 2] = Math.random() * Math.PI * 2;
-    this.puffMetaData[i4 + 3] = Math.floor(mode) + Math.random() * 0.999;
+    const i3 = idx * 3;
+    this.puffSpawnPosData[i3] = x;
+    this.puffSpawnPosData[i3 + 1] = y;
+    this.puffSpawnPosData[i3 + 2] = z;
+
+    this.puffSpawnVelData[i3] = vx;
+    this.puffSpawnVelData[i3 + 1] = vy;
+    this.puffSpawnVelData[i3 + 2] = vz;
+
+    this.puffSpawnTimeData[idx] = this.simTime;
+    this.puffLifeData[idx] = safeLife;
+    this.puffSeedData[idx] = Math.floor(mode) + Math.random() * 0.999;
+
+    const i4 = idx * 4;
+    this.puffKinematicsData[i4] = drag;
+    this.puffKinematicsData[i4 + 1] = buoyancy;
+    this.puffKinematicsData[i4 + 2] = Math.random() * Math.PI * 2;
+    this.puffKinematicsData[i4 + 3] = spin;
+
+    this.puffScaleTempData[i4] = startScale;
+    this.puffScaleTempData[i4 + 1] = endScale;
+    this.puffScaleTempData[i4 + 2] = startTemp;
+    this.puffScaleTempData[i4 + 3] = endTemp;
 
     this.puffColorAlphaData[i4] = r;
     this.puffColorAlphaData[i4 + 1] = g;
     this.puffColorAlphaData[i4 + 2] = b;
     this.puffColorAlphaData[i4 + 3] = alpha;
 
-    this.puffVx[idx] = vx;
-    this.puffVy[idx] = vy;
-    this.puffVz[idx] = vz;
-    this.puffAge[idx] = 0;
-    this.puffLife[idx] = Math.max(0.05, life);
-    this.puffStartScale[idx] = startScale;
-    this.puffEndScale[idx] = endScale;
-    this.puffStartTemp[idx] = startTemp;
-    this.puffEndTemp[idx] = endTemp;
-    this.puffDrag[idx] = drag;
-    this.puffBuoyancy[idx] = buoyancy;
-    this.puffSpin[idx] = spin;
-
+    this.activePuffs = this.puffHighWater;
     this.puffGeo.instanceCount = this.puffHighWater;
-    this.puffPosScaleAttr.needsUpdate = true;
-    this.puffMetaAttr.needsUpdate = true;
-    this.puffColorAlphaAttr.needsUpdate = true;
+    this.puffMesh.visible = true;
   }
 
   public emitSpark(
@@ -708,37 +951,50 @@ export class GpuParticleSystem {
     gravity = 26.0,
   ): void {
     const idx = this.sparkCursor;
-    this.sparkCursor = (this.sparkCursor + 1) % SPARK_CAPACITY;
+    if (this.sparkDirtyCount === 0) {
+      this.sparkDirtyStart = idx;
+    }
+    if (this.sparkDirtyCount < SPARK_CAPACITY) {
+      this.sparkDirtyCount++;
+    }
+
+    this.sparkCursor = (idx + 1) % SPARK_CAPACITY;
     if (idx + 1 > this.sparkHighWater) {
       this.sparkHighWater = idx + 1;
     }
 
+    const safeLife = Math.max(0.05, life);
+    const expiry = this.simTime + safeLife;
+    if (expiry > this.sparkMaxExpiry) {
+      this.sparkMaxExpiry = expiry;
+    }
+
+    const i3 = idx * 3;
+    this.sparkSpawnPosData[i3] = x;
+    this.sparkSpawnPosData[i3 + 1] = y;
+    this.sparkSpawnPosData[i3 + 2] = z;
+
+    this.sparkSpawnVelData[i3] = vx;
+    this.sparkSpawnVelData[i3 + 1] = vy;
+    this.sparkSpawnVelData[i3 + 2] = vz;
+
+    this.sparkSpawnTimeData[idx] = this.simTime;
+    this.sparkLifeData[idx] = safeLife;
+    this.sparkSeedData[idx] = Math.random();
+
+    this.sparkParamsData[i3] = size;
+    this.sparkParamsData[i3 + 1] = drag;
+    this.sparkParamsData[i3 + 2] = gravity;
+
     const i4 = idx * 4;
-    this.sparkPosSizeData[i4] = x;
-    this.sparkPosSizeData[i4 + 1] = y;
-    this.sparkPosSizeData[i4 + 2] = z;
-    this.sparkPosSizeData[i4 + 3] = size;
-
-    this.sparkVelLifeData[i4] = vx;
-    this.sparkVelLifeData[i4 + 1] = vy;
-    this.sparkVelLifeData[i4 + 2] = vz;
-    this.sparkVelLifeData[i4 + 3] = 0;
-
     this.sparkColorHeatData[i4] = r;
     this.sparkColorHeatData[i4 + 1] = g;
     this.sparkColorHeatData[i4 + 2] = b;
     this.sparkColorHeatData[i4 + 3] = heat;
 
-    this.sparkAge[idx] = 0;
-    this.sparkLife[idx] = Math.max(0.05, life);
-    this.sparkBaseSize[idx] = size;
-    this.sparkDrag[idx] = drag;
-    this.sparkGravity[idx] = gravity;
-
+    this.activeSparks = this.sparkHighWater;
     this.sparkGeo.instanceCount = this.sparkHighWater;
-    this.sparkPosSizeAttr.needsUpdate = true;
-    this.sparkVelLifeAttr.needsUpdate = true;
-    this.sparkColorHeatAttr.needsUpdate = true;
+    this.sparkMesh.visible = true;
   }
 
   public emitDebris(
@@ -757,16 +1013,36 @@ export class GpuParticleSystem {
     prism = 0,
   ): void {
     const idx = this.debrisCursor;
-    this.debrisCursor = (this.debrisCursor + 1) % DEBRIS_CAPACITY;
+    if (this.debrisDirtyCount === 0) {
+      this.debrisDirtyStart = idx;
+    }
+    if (this.debrisDirtyCount < DEBRIS_CAPACITY) {
+      this.debrisDirtyCount++;
+    }
+
+    this.debrisCursor = (idx + 1) % DEBRIS_CAPACITY;
     if (idx + 1 > this.debrisHighWater) {
       this.debrisHighWater = idx + 1;
     }
 
-    const i4 = idx * 4;
-    this.debrisPosScaleData[i4] = x;
-    this.debrisPosScaleData[i4 + 1] = y;
-    this.debrisPosScaleData[i4 + 2] = z;
-    this.debrisPosScaleData[i4 + 3] = scale;
+    const safeLife = Math.max(0.1, life);
+    const expiry = this.simTime + safeLife;
+    if (expiry > this.debrisMaxExpiry) {
+      this.debrisMaxExpiry = expiry;
+    }
+
+    const i3 = idx * 3;
+    this.debrisSpawnPosData[i3] = x;
+    this.debrisSpawnPosData[i3 + 1] = y;
+    this.debrisSpawnPosData[i3 + 2] = z;
+
+    this.debrisSpawnVelData[i3] = vx;
+    this.debrisSpawnVelData[i3 + 1] = vy;
+    this.debrisSpawnVelData[i3 + 2] = vz;
+
+    this.debrisSpawnTimeData[idx] = this.simTime;
+    this.debrisLifeData[idx] = safeLife;
+    this.debrisSeedData[idx] = Math.random();
 
     // Seed an arbitrary unit quaternion without allocating objects
     const qx = Math.random() - 0.5;
@@ -774,307 +1050,133 @@ export class GpuParticleSystem {
     const qz = Math.random() - 0.5;
     const qw = Math.random() - 0.5;
     const qLen = Math.hypot(qx, qy, qz, qw) || 1;
-    this.debrisQuatData[i4] = qx / qLen;
-    this.debrisQuatData[i4 + 1] = qy / qLen;
-    this.debrisQuatData[i4 + 2] = qz / qLen;
-    this.debrisQuatData[i4 + 3] = qw / qLen;
+    const i4 = idx * 4;
+    this.debrisInitQuatData[i4] = qx / qLen;
+    this.debrisInitQuatData[i4 + 1] = qy / qLen;
+    this.debrisInitQuatData[i4 + 2] = qz / qLen;
+    this.debrisInitQuatData[i4 + 3] = qw / qLen;
 
-    this.debrisHeatLifeData[i4] = 0;
-    this.debrisHeatLifeData[i4 + 1] = heat;
-    this.debrisHeatLifeData[i4 + 2] = prism;
-    this.debrisHeatLifeData[i4 + 3] = Math.random();
+    this.debrisAngularVelData[i3] = wx;
+    this.debrisAngularVelData[i3 + 1] = wy;
+    this.debrisAngularVelData[i3 + 2] = wz;
 
-    this.debrisVx[idx] = vx;
-    this.debrisVy[idx] = vy;
-    this.debrisVz[idx] = vz;
-    this.debrisWx[idx] = wx;
-    this.debrisWy[idx] = wy;
-    this.debrisWz[idx] = wz;
-    this.debrisAge[idx] = 0;
-    this.debrisLife[idx] = Math.max(0.1, life);
-    this.debrisBaseScale[idx] = scale;
-    this.debrisSmokeTimer[idx] = Math.random() * 0.035;
+    this.debrisMetaData[i3] = scale;
+    this.debrisMetaData[i3 + 1] = heat;
+    this.debrisMetaData[i3 + 2] = prism;
 
+    this.activeDebris = this.debrisHighWater;
     this.debrisGeo.instanceCount = this.debrisHighWater;
-    this.debrisPosScaleAttr.needsUpdate = true;
-    this.debrisQuatAttr.needsUpdate = true;
-    this.debrisHeatLifeAttr.needsUpdate = true;
+    this.debrisMesh.visible = true;
   }
 
   public clear(): void {
-    this.puffLife.fill(0);
-    this.puffPosScaleData.fill(0);
+    this.simTime = 0;
+
     this.puffCursor = 0;
     this.puffHighWater = 0;
+    this.puffDirtyStart = 0;
+    this.puffDirtyCount = 0;
+    this.puffMaxExpiry = 0;
     this.activePuffs = 0;
     this.puffGeo.instanceCount = 0;
-    this.puffPosScaleAttr.needsUpdate = true;
+    this.puffMesh.visible = false;
 
-    this.sparkLife.fill(0);
-    this.sparkPosSizeData.fill(0);
     this.sparkCursor = 0;
     this.sparkHighWater = 0;
+    this.sparkDirtyStart = 0;
+    this.sparkDirtyCount = 0;
+    this.sparkMaxExpiry = 0;
     this.activeSparks = 0;
     this.sparkGeo.instanceCount = 0;
-    this.sparkPosSizeAttr.needsUpdate = true;
+    this.sparkMesh.visible = false;
 
-    this.debrisLife.fill(0);
-    this.debrisPosScaleData.fill(0);
     this.debrisCursor = 0;
     this.debrisHighWater = 0;
+    this.debrisDirtyStart = 0;
+    this.debrisDirtyCount = 0;
+    this.debrisMaxExpiry = 0;
     this.activeDebris = 0;
     this.debrisGeo.instanceCount = 0;
-    this.debrisPosScaleAttr.needsUpdate = true;
+    this.debrisMesh.visible = false;
 
     this.flashIntensity = 0;
+    this.puffMat.uniforms.uSimTime.value = 0;
     this.puffMat.uniforms.uFlashIntensity.value = 0;
+    this.sparkMat.uniforms.uSimTime.value = 0;
+    this.debrisMat.uniforms.uSimTime.value = 0;
     this.debrisMat.uniforms.uFlashIntensity.value = 0;
   }
 
   public update(dt: number, time: number, tripIntensity: number): void {
     const safeDt = Math.max(0, Math.min(dt, 0.05));
+    this.simTime += safeDt;
+
+    this.puffMat.uniforms.uSimTime.value = this.simTime;
     this.puffMat.uniforms.uTime.value = time;
     this.puffMat.uniforms.uTrip.value = tripIntensity;
+
+    this.sparkMat.uniforms.uSimTime.value = this.simTime;
+
+    this.debrisMat.uniforms.uSimTime.value = this.simTime;
     this.debrisMat.uniforms.uTime.value = time;
 
-    // 1. Integrate tumbling flaming debris FIRST so live shards emit trailing smoke & embers
-    if (this.debrisHighWater > 0) {
-      let liveDebris = 0;
-      const hw = this.debrisHighWater;
-      const posScale = this.debrisPosScaleData;
-      const quat = this.debrisQuatData;
-      const heatLife = this.debrisHeatLifeData;
-
-      for (let i = 0; i < hw; i++) {
-        const life = this.debrisLife[i];
-        if (life <= 0) continue;
-
-        const age = this.debrisAge[i] + safeDt;
-        const i4 = i * 4;
-        if (age >= life) {
-          this.debrisLife[i] = 0;
-          posScale[i4 + 3] = 0;
-          heatLife[i4] = 1;
-          continue;
-        }
-
-        this.debrisAge[i] = age;
-        const t = age / life;
-        liveDebris++;
-
-        const dragFactor = Math.max(0, 1 - 0.24 * safeDt);
-        const vx = this.debrisVx[i] * dragFactor;
-        const vy = (this.debrisVy[i] - 46 * safeDt) * dragFactor;
-        const vz = this.debrisVz[i] * dragFactor;
-        this.debrisVx[i] = vx;
-        this.debrisVy[i] = vy;
-        this.debrisVz[i] = vz;
-
-        const px = posScale[i4] + vx * safeDt;
-        const py = posScale[i4 + 1] + vy * safeDt;
-        const pz = posScale[i4 + 2] + vz * safeDt;
-        posScale[i4] = px;
-        posScale[i4 + 1] = py;
-        posScale[i4 + 2] = pz;
-        posScale[i4 + 3] = this.debrisBaseScale[i] * (1 - t * 0.48);
-
-        // Scalar quaternion integration: q' = q + 0.5 * dt * (w, 0) * q
-        const qx = quat[i4];
-        const qy = quat[i4 + 1];
-        const qz = quat[i4 + 2];
-        const qw = quat[i4 + 3];
-        const wx = this.debrisWx[i];
-        const wy = this.debrisWy[i];
-        const wz = this.debrisWz[i];
-        const halfDt = 0.5 * safeDt;
-
-        const nqx = qx + halfDt * (wx * qw + wy * qz - wz * qy);
-        const nqy = qy + halfDt * (wy * qw + wz * qx - wx * qz);
-        const nqz = qz + halfDt * (wz * qw + wx * qy - wy * qx);
-        const nqw = qw + halfDt * (-wx * qx - wy * qy - wz * qz);
-        const qLen = Math.hypot(nqx, nqy, nqz, nqw) || 1;
-        quat[i4] = nqx / qLen;
-        quat[i4 + 1] = nqy / qLen;
-        quat[i4 + 2] = nqz / qLen;
-        quat[i4 + 3] = nqw / qLen;
-
-        heatLife[i4] = t;
-
-        // Emit curling dark soot & glowing ember trail behind live flaming fuselage shards
-        if (safeDt > 0 && t < 0.85) {
-          const timer = this.debrisSmokeTimer[i] + safeDt;
-          if (timer >= 0.036) {
-            this.debrisSmokeTimer[i] = timer - 0.036;
-            const trailHeat = Math.max(0.05, heatLife[i4 + 1] * (1 - t) * 0.72);
-            const isPrism = heatLife[i4 + 2] > 0.5 ? 1 : 0;
-            this.emitPuff(
-              px,
-              py,
-              pz,
-              vx * 0.14 + (Math.random() - 0.5) * 8,
-              vy * 0.14 + 5 + Math.random() * 6,
-              vz * 0.14 + (Math.random() - 0.5) * 8,
-              2.6 + this.debrisBaseScale[i] * 1.4,
-              9.5 + this.debrisBaseScale[i] * 4.2,
-              0.75 + Math.random() * 0.65,
-              trailHeat,
-              0.0,
-              0.16,
-              0.14,
-              0.15,
-              0.55,
-              1.6,
-              8.0,
-              (Math.random() - 0.5) * 1.6,
-              isPrism,
-            );
-            if (t < 0.45 && Math.random() < 0.35) {
-              this.emitSpark(
-                px,
-                py,
-                pz,
-                vx * 0.35 + (Math.random() - 0.5) * 24,
-                vy * 0.35 + (Math.random() - 0.5) * 24,
-                vz * 0.35 + (Math.random() - 0.5) * 24,
-                0.75,
-                0.35 + Math.random() * 0.3,
-                1.0,
-                0.55,
-                0.15,
-                1.1,
-                0.9,
-                18.0,
-              );
-            }
-          } else {
-            this.debrisSmokeTimer[i] = timer;
-          }
-        }
+    // Upload ONLY newly spawned dirty ring-buffer slices to GPU (zero CPU particle loops)
+    if (this.puffDirtyCount > 0) {
+      for (let i = 0; i < this.puffAttrs.length; i++) {
+        flushAttributeDirtySlice(
+          this.puffAttrs[i],
+          this.puffDirtyStart,
+          this.puffDirtyCount,
+          PUFF_CAPACITY,
+        );
       }
-
-      this.activeDebris = liveDebris;
-      if (liveDebris === 0) {
-        this.debrisHighWater = 0;
-        this.debrisCursor = 0;
-        this.debrisGeo.instanceCount = 0;
-      } else {
-        this.debrisGeo.instanceCount = this.debrisHighWater;
-      }
-      this.debrisPosScaleAttr.needsUpdate = true;
-      this.debrisQuatAttr.needsUpdate = true;
-      this.debrisHeatLifeAttr.needsUpdate = true;
+      this.puffDirtyCount = 0;
+      this.puffDirtyStart = this.puffCursor;
+    } else if (this.puffHighWater > 0 && this.simTime > this.puffMaxExpiry) {
+      // Every spawned puff has expired; reclaim pool draw call in O(1)
+      this.puffHighWater = 0;
+      this.puffCursor = 0;
+      this.activePuffs = 0;
+      this.puffGeo.instanceCount = 0;
+      this.puffMesh.visible = false;
     }
 
-    // 2. Integrate volumetric fireball & billowing smoke puffs (6,400 pool)
-    if (this.puffHighWater > 0) {
-      let livePuffs = 0;
-      const hw = this.puffHighWater;
-      const posScale = this.puffPosScaleData;
-      const meta = this.puffMetaData;
-
-      for (let i = 0; i < hw; i++) {
-        const life = this.puffLife[i];
-        if (life <= 0) continue;
-
-        const age = this.puffAge[i] + safeDt;
-        const i4 = i * 4;
-        if (age >= life) {
-          this.puffLife[i] = 0;
-          posScale[i4 + 3] = 0;
-          meta[i4] = 1;
-          continue;
-        }
-
-        this.puffAge[i] = age;
-        const t = age / life;
-        livePuffs++;
-
-        const drag = Math.max(0, 1 - this.puffDrag[i] * safeDt);
-        const vx = this.puffVx[i] * drag;
-        const vy = (this.puffVy[i] + this.puffBuoyancy[i] * safeDt) * drag;
-        const vz = this.puffVz[i] * drag;
-        this.puffVx[i] = vx;
-        this.puffVy[i] = vy;
-        this.puffVz[i] = vz;
-
-        posScale[i4] += vx * safeDt;
-        posScale[i4 + 1] += vy * safeDt;
-        posScale[i4 + 2] += vz * safeDt;
-
-        // Smooth ease-out expansion for roiling billows
-        const expand = 1 - (1 - t) * (1 - t);
-        posScale[i4 + 3] =
-          this.puffStartScale[i] + (this.puffEndScale[i] - this.puffStartScale[i]) * expand;
-
-        // Exponentially rapid cooling from white plasma into ember-lit smoke
-        const cool = 1 - (1 - t) * (1 - t) * (1 - t);
-        meta[i4] = t;
-        meta[i4 + 1] = this.puffStartTemp[i] + (this.puffEndTemp[i] - this.puffStartTemp[i]) * cool;
-        meta[i4 + 2] += this.puffSpin[i] * safeDt;
+    if (this.sparkDirtyCount > 0) {
+      for (let i = 0; i < this.sparkAttrs.length; i++) {
+        flushAttributeDirtySlice(
+          this.sparkAttrs[i],
+          this.sparkDirtyStart,
+          this.sparkDirtyCount,
+          SPARK_CAPACITY,
+        );
       }
-
-      this.activePuffs = livePuffs;
-      if (livePuffs === 0) {
-        this.puffHighWater = 0;
-        this.puffCursor = 0;
-        this.puffGeo.instanceCount = 0;
-      } else {
-        this.puffGeo.instanceCount = this.puffHighWater;
-      }
-      this.puffPosScaleAttr.needsUpdate = true;
-      this.puffMetaAttr.needsUpdate = true;
+      this.sparkDirtyCount = 0;
+      this.sparkDirtyStart = this.sparkCursor;
+    } else if (this.sparkHighWater > 0 && this.simTime > this.sparkMaxExpiry) {
+      this.sparkHighWater = 0;
+      this.sparkCursor = 0;
+      this.activeSparks = 0;
+      this.sparkGeo.instanceCount = 0;
+      this.sparkMesh.visible = false;
     }
 
-    // 3. Integrate velocity-stretched glowing magnesium sparks (4,200 pool)
-    if (this.sparkHighWater > 0) {
-      let liveSparks = 0;
-      const hw = this.sparkHighWater;
-      const posSize = this.sparkPosSizeData;
-      const velLife = this.sparkVelLifeData;
-
-      for (let i = 0; i < hw; i++) {
-        const life = this.sparkLife[i];
-        if (life <= 0) continue;
-
-        const age = this.sparkAge[i] + safeDt;
-        const i4 = i * 4;
-        if (age >= life) {
-          this.sparkLife[i] = 0;
-          posSize[i4 + 3] = 0;
-          velLife[i4 + 3] = 1;
-          continue;
-        }
-
-        this.sparkAge[i] = age;
-        const t = age / life;
-        liveSparks++;
-
-        const drag = Math.max(0, 1 - this.sparkDrag[i] * safeDt);
-        const vx = velLife[i4] * drag;
-        const vy = (velLife[i4 + 1] - this.sparkGravity[i] * safeDt) * drag;
-        const vz = velLife[i4 + 2] * drag;
-
-        velLife[i4] = vx;
-        velLife[i4 + 1] = vy;
-        velLife[i4 + 2] = vz;
-        velLife[i4 + 3] = t;
-
-        posSize[i4] += vx * safeDt;
-        posSize[i4 + 1] += vy * safeDt;
-        posSize[i4 + 2] += vz * safeDt;
-        posSize[i4 + 3] = this.sparkBaseSize[i] * (1 - t * 0.45);
+    if (this.debrisDirtyCount > 0) {
+      for (let i = 0; i < this.debrisAttrs.length; i++) {
+        flushAttributeDirtySlice(
+          this.debrisAttrs[i],
+          this.debrisDirtyStart,
+          this.debrisDirtyCount,
+          DEBRIS_CAPACITY,
+        );
       }
-
-      this.activeSparks = liveSparks;
-      if (liveSparks === 0) {
-        this.sparkHighWater = 0;
-        this.sparkCursor = 0;
-        this.sparkGeo.instanceCount = 0;
-      } else {
-        this.sparkGeo.instanceCount = this.sparkHighWater;
-      }
-      this.sparkPosSizeAttr.needsUpdate = true;
-      this.sparkVelLifeAttr.needsUpdate = true;
+      this.debrisDirtyCount = 0;
+      this.debrisDirtyStart = this.debrisCursor;
+    } else if (this.debrisHighWater > 0 && this.simTime > this.debrisMaxExpiry) {
+      this.debrisHighWater = 0;
+      this.debrisCursor = 0;
+      this.activeDebris = 0;
+      this.debrisGeo.instanceCount = 0;
+      this.debrisMesh.visible = false;
     }
   }
 }
