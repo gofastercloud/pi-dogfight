@@ -66,6 +66,30 @@ declare global {
   }
 }
 
+const DRS_MIN_DPR = 1.15;
+const DRS_MAX_DPR = 2.0;
+const DRS_DOWN_THRESHOLD_MS = 10.2; // Sustained > 10.2ms (~98 fps) steps DPR down toward 120 fps target
+const DRS_UP_THRESHOLD_MS = 8.75;   // Sustained <= 8.75ms (~114–120 fps) steps DPR back up
+const DRS_STEP_DOWN = 0.15;
+const DRS_STEP_UP = 0.10;
+const DRS_WINDOW_FRAMES = 24;
+const DRS_DOWN_COOLDOWN_SEC = 0.65;
+const DRS_UP_COOLDOWN_SEC = 1.6;
+const DRS_UP_REQUIRED_WINDOWS = 2;
+
+function getNativeDpr(): number {
+  return Math.min(Math.max(window.devicePixelRatio || 1, 1), DRS_MAX_DPR);
+}
+
+function getMinAutoDpr(nativeDpr: number): number {
+  return Math.min(DRS_MIN_DPR, nativeDpr);
+}
+
+function quantiseDpr(dpr: number, minDpr: number, maxDpr: number): number {
+  const clamped = THREE.MathUtils.clamp(dpr, minDpr, maxDpr);
+  return THREE.MathUtils.clamp(Math.round(clamped * 20) / 20, minDpr, maxDpr);
+}
+
 function formatTime(sec: number): string {
   const s = Math.max(0, Math.floor(sec));
   const m = Math.floor(s / 60);
@@ -97,6 +121,7 @@ async function bootstrap(): Promise<void> {
   const btnRestart = document.getElementById('btn-restart') as HTMLButtonElement;
   const btnMute = document.getElementById('btn-mute') as HTMLButtonElement;
   const btnHud = document.getElementById('btn-hud') as HTMLButtonElement;
+  const btnDrs = document.getElementById('btn-drs') as HTMLButtonElement;
   const scrubber = document.getElementById('scrubber') as HTMLInputElement;
   const timeCurrentEl = document.getElementById('time-current')!;
   const timeTotalEl = document.getElementById('time-total')!;
@@ -110,13 +135,17 @@ async function bootstrap(): Promise<void> {
   // ------------------------------------------------------------------
   // 1. RENDERER, SCENE, CAMERA & ORBIT CONTROLS
   // ------------------------------------------------------------------
+  const initialWidth = Math.max(1, window.innerWidth);
+  const initialHeight = Math.max(1, window.innerHeight);
+  const initialDpr = getNativeDpr();
+
   const renderer = new THREE.WebGLRenderer({
     canvas,
     antialias: false, // MSAA handled inside HalfFloat EffectComposer render target
     powerPreference: 'high-performance',
   });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
-  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setPixelRatio(initialDpr);
+  renderer.setSize(initialWidth, initialHeight);
   renderer.toneMapping = THREE.NoToneMapping; // ACES applied in our custom final shader pass
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   renderer.info.autoReset = false; // Manually reset once per composed frame for accurate multi-pass telemetry
@@ -124,7 +153,7 @@ async function bootstrap(): Promise<void> {
   const scene = new THREE.Scene();
   scene.fog = new THREE.FogExp2(0x281c28, 0.00018);
 
-  const camera = new THREE.PerspectiveCamera(64, window.innerWidth / window.innerHeight, 0.8, 16000);
+  const camera = new THREE.PerspectiveCamera(64, initialWidth / initialHeight, 0.8, 16000);
   camera.position.set(22, 42, 130);
 
   const orbitControls = new OrbitControls(camera, canvas);
@@ -138,6 +167,7 @@ async function bootstrap(): Promise<void> {
   const env = new WorldEnvironment(scene, renderer);
   const vfx = new BayhemVFX(scene);
   const post = new PostPipeline(renderer, scene, camera);
+  post.setSize(initialWidth, initialHeight);
   const audio = new AudioEngine();
   const hud = new FighterHUD(hudCanvas);
 
@@ -206,9 +236,152 @@ async function bootstrap(): Promise<void> {
   const frameSortScratch = new Float64Array(FRAME_RING_CAPACITY);
   let frameRingHead = 0;
   let frameRingCount = 0;
-  const drsMode: DrsMode = 'native';
+
+  // Hysteresis-guarded Dynamic Resolution Scaler (AUTO: [1.15, native], NATIVE: locked)
+  let drsMode: DrsMode = 'auto';
+  let appliedWidth = initialWidth;
+  let appliedHeight = initialHeight;
+  let appliedDpr = initialDpr;
+  let drsAccumMs = 0;
+  let drsSampleCount = 0;
+  let drsCooldownUntilSec = 0;
+  let drsGoodWindows = 0;
+  let lastPerfText = '';
+
+  const updatePerfReadout = (force = false) => {
+    const text = `${currentFps} FPS · ${appliedDpr.toFixed(2)}×`;
+    if (force || text !== lastPerfText) {
+      lastPerfText = text;
+      perfReadout.textContent = text;
+    }
+  };
+
+  const resetDrsWindow = (cooldownSec = 0.5) => {
+    drsAccumMs = 0;
+    drsSampleCount = 0;
+    drsGoodWindows = 0;
+    drsCooldownUntilSec = performance.now() / 1000 + cooldownSec;
+  };
+
+  const applyViewportResolution = (w: number, h: number, targetDpr: number) => {
+    const safeW = Math.max(1, Math.round(w));
+    const safeH = Math.max(1, Math.round(h));
+    const safeDpr = Math.round(targetDpr * 100) / 100;
+
+    const sizeChanged = safeW !== appliedWidth || safeH !== appliedHeight;
+    const dprChanged = Math.abs(safeDpr - appliedDpr) >= 0.005;
+    if (!sizeChanged && !dprChanged) return;
+
+    appliedWidth = safeW;
+    appliedHeight = safeH;
+    appliedDpr = safeDpr;
+
+    if (sizeChanged) {
+      camera.aspect = safeW / safeH;
+      camera.updateProjectionMatrix();
+    }
+    if (dprChanged) {
+      renderer.setPixelRatio(safeDpr);
+      // Sync EffectComposer's internal pixel ratio before a single post.setSize() call
+      // so simultaneous viewport + DPR changes never trigger double FBO reallocations.
+      const composerInternal = post.composer as unknown as { _pixelRatio?: number };
+      if (typeof composerInternal._pixelRatio === 'number') {
+        composerInternal._pixelRatio = safeDpr;
+      } else {
+        post.composer.setPixelRatio(safeDpr);
+      }
+    }
+    if (sizeChanged) {
+      renderer.setSize(safeW, safeH);
+    }
+    // Single pass resize (RenderTarget.setSize is a no-op when dimensions already match)
+    post.setSize(safeW, safeH);
+    if (sizeChanged) {
+      hud.resize();
+    }
+    updatePerfReadout(true);
+  };
+
+  const updateDrs = (frameMs: number, nowSec: number) => {
+    if (drsMode !== 'auto' || !hasLaunched || !isPlaying || isScrubbing) return;
+    const nativeDpr = getNativeDpr();
+    const minDpr = getMinAutoDpr(nativeDpr);
+    if (nativeDpr <= minDpr + 0.005) return; // Nothing to scale on 1× displays
+    if (nowSec < drsCooldownUntilSec) return;
+    if (frameMs <= 0 || frameMs > 100) return; // Ignore tab backgrounding / pause gaps
+
+    drsAccumMs += frameMs;
+    drsSampleCount++;
+    if (drsSampleCount < DRS_WINDOW_FRAMES) return;
+
+    const avgMs = drsAccumMs / drsSampleCount;
+    drsAccumMs = 0;
+    drsSampleCount = 0;
+
+    if (avgMs > DRS_DOWN_THRESHOLD_MS) {
+      drsGoodWindows = 0;
+      if (appliedDpr > minDpr + 0.01) {
+        const nextDpr = quantiseDpr(appliedDpr - DRS_STEP_DOWN, minDpr, nativeDpr);
+        if (Math.abs(nextDpr - appliedDpr) >= 0.04) {
+          applyViewportResolution(window.innerWidth, window.innerHeight, nextDpr);
+          drsCooldownUntilSec = nowSec + DRS_DOWN_COOLDOWN_SEC;
+        }
+      }
+    } else if (avgMs <= DRS_UP_THRESHOLD_MS) {
+      drsGoodWindows++;
+      if (drsGoodWindows >= DRS_UP_REQUIRED_WINDOWS && appliedDpr < nativeDpr - 0.01) {
+        const nextDpr = quantiseDpr(appliedDpr + DRS_STEP_UP, minDpr, nativeDpr);
+        if (Math.abs(nextDpr - appliedDpr) >= 0.04) {
+          applyViewportResolution(window.innerWidth, window.innerHeight, nextDpr);
+          drsGoodWindows = 0;
+          drsCooldownUntilSec = nowSec + DRS_UP_COOLDOWN_SEC;
+        }
+      }
+    } else {
+      // Inside hysteresis deadband [8.75ms, 10.2ms]: hold DPR steady without oscillating
+      drsGoodWindows = 0;
+    }
+  };
+
+  // Cache scene PointLights once and pad with zero-intensity PointLights to keep
+  // Three.js NUM_POINT_LIGHTS constant across bandit kills & detonations (zero mid-flight recompile).
+  const TARGET_POINT_LIGHTS = 6;
+  const scenePointLights: THREE.PointLight[] = [];
+  scene.traverse((obj) => {
+    if (obj instanceof THREE.PointLight) {
+      scenePointLights.push(obj);
+    }
+  });
+  const padPointLights: THREE.PointLight[] = [];
+  for (let i = 0; i < TARGET_POINT_LIGHTS; i++) {
+    const pad = new THREE.PointLight(0x000000, 0, 1);
+    pad.visible = false;
+    scene.add(pad);
+    padPointLights.push(pad);
+  }
+
+  const syncConstantPointLightCount = () => {
+    let activeCount = 0;
+    for (let i = 0; i < scenePointLights.length; i++) {
+      let cur: THREE.Object3D | null = scenePointLights[i];
+      let vis = true;
+      while (cur) {
+        if (!cur.visible) {
+          vis = false;
+          break;
+        }
+        cur = cur.parent;
+      }
+      if (vis) activeCount++;
+    }
+    const neededPads = Math.max(0, TARGET_POINT_LIGHTS - activeCount);
+    for (let i = 0; i < padPointLights.length; i++) {
+      padPointLights[i].visible = i < neededPads;
+    }
+  };
 
   const renderPostFrame = () => {
+    syncConstantPointLightCount();
     renderer.info.reset();
     post.render();
   };
@@ -287,6 +460,30 @@ async function bootstrap(): Promise<void> {
     }
   };
 
+  const syncDrsButton = () => {
+    const isAuto = drsMode === 'auto';
+    btnDrs.textContent = isAuto ? 'DRS: AUTO' : 'DRS: NATIVE';
+    btnDrs.classList.toggle('active', isAuto);
+    btnDrs.classList.toggle('drs-native', !isAuto);
+    btnDrs.setAttribute('aria-pressed', String(isAuto));
+  };
+
+  const toggleDrsMode = () => {
+    drsMode = drsMode === 'auto' ? 'native' : 'auto';
+    syncDrsButton();
+    if (drsMode === 'native') {
+      applyViewportResolution(window.innerWidth, window.innerHeight, getNativeDpr());
+    }
+    resetDrsWindow(0.4);
+    updatePerfReadout(true);
+    if (hasLaunched && !isPlaying) {
+      applySceneFrame(0.016, performance.now() / 1000, false, false);
+    }
+  };
+
+  syncDrsButton();
+  updatePerfReadout(true);
+
   const startDemoFrom = async (startTime = 0) => {
     hasLaunched = true;
     finaleShown = false;
@@ -311,6 +508,7 @@ async function bootstrap(): Promise<void> {
     syncTimelineDom(choreography.currentTime, true);
     isPlaying = true;
     syncPlayButton();
+    resetDrsWindow(0.6);
     applySceneFrame(0.016, clampedStart, false, true);
 
     try {
@@ -337,6 +535,7 @@ async function bootstrap(): Promise<void> {
       }
       finaleOverlay.classList.add('hidden');
       finaleShown = false;
+      resetDrsWindow(0.5);
       try {
         await audio.unlockAndInit();
         if (isPlaying) {
@@ -350,13 +549,28 @@ async function bootstrap(): Promise<void> {
     }
   };
 
-  // Preload all 14 fal.ai audio assets in the background immediately
-  audio.preloadAll((loaded, total) => {
-    if (loaded < total) {
-      launchStatus.textContent = `Loading bespoke fal.ai audio stems (${loaded}/${total})...`;
+  // Preload all 14 fal.ai audio assets in the background immediately while pre-compiling shaders
+  let audioLoadedCount = 0;
+  let audioTotalCount = 14;
+  let shadersCompiled = false;
+
+  const updateLaunchStatus = () => {
+    if (!shadersCompiled) {
+      launchStatus.textContent =
+        audioLoadedCount < audioTotalCount
+          ? `Compiling WebGL2 shaders & loading audio stems (${audioLoadedCount}/${audioTotalCount})...`
+          : `Compiling WebGL2 shaders · all ${audioTotalCount} audio stems armed...`;
+    } else if (audioLoadedCount < audioTotalCount) {
+      launchStatus.textContent = `WebGL2 shaders compiled · loading audio stems (${audioLoadedCount}/${audioTotalCount})...`;
     } else {
-      launchStatus.textContent = `All ${total} audio stems armed · WebGL HDR pipeline ready.`;
+      launchStatus.textContent = `All ${audioTotalCount} audio stems armed · WebGL2 HDR pipeline ready.`;
     }
+  };
+
+  audio.preloadAll((loaded, total) => {
+    audioLoadedCount = loaded;
+    audioTotalCount = total;
+    updateLaunchStatus();
   });
 
   // Button listeners
@@ -371,6 +585,7 @@ async function bootstrap(): Promise<void> {
   btnRestart.addEventListener('click', () => void startDemoFrom(0));
   btnMute.addEventListener('click', toggleMute);
   btnHud.addEventListener('click', toggleHud);
+  btnDrs.addEventListener('click', toggleDrsMode);
 
   camButtons.forEach((btn) => {
     btn.addEventListener('click', () => {
@@ -387,6 +602,7 @@ async function bootstrap(): Promise<void> {
     }
     choreography.reset(clampedT);
     syncTimelineDom(choreography.currentTime, true);
+    resetDrsWindow(0.4);
     applySceneFrame(0.016, clampedT, false, true);
     if (resumeAudio && isPlaying) {
       void audio
@@ -402,22 +618,31 @@ async function bootstrap(): Promise<void> {
     }
   };
 
+  let scrubCommitPending = false;
+  const finishScrub = () => {
+    if (!scrubCommitPending && !isScrubbing) return;
+    isScrubbing = false;
+    scrubCommitPending = false;
+    commitScrub(parseFloat(scrubber.value), true);
+  };
+
   scrubber.addEventListener('input', () => {
     isScrubbing = true;
+    scrubCommitPending = true;
     commitScrub(parseFloat(scrubber.value), false);
   });
 
   scrubber.addEventListener('change', () => {
-    isScrubbing = false;
-    commitScrub(parseFloat(scrubber.value), true);
-  });
-
-  scrubber.addEventListener('pointerup', () => {
-    if (isScrubbing) {
-      isScrubbing = false;
+    // Prevent duplicate audio restarts when mouse release already committed via pointerup
+    if (scrubCommitPending || isScrubbing) {
+      finishScrub();
+    } else if (Math.abs(parseFloat(scrubber.value) - choreography.currentTime) > 0.05) {
       commitScrub(parseFloat(scrubber.value), true);
     }
   });
+
+  scrubber.addEventListener('pointerup', finishScrub);
+  scrubber.addEventListener('pointercancel', finishScrub);
 
   tripSlider.addEventListener('input', () => {
     const val = THREE.MathUtils.clamp(parseFloat(tripSlider.value) || 0, 0, 1.5);
@@ -452,6 +677,7 @@ async function bootstrap(): Promise<void> {
     else if (e.key === '5') setCameraMode('cinematic');
     else if (keyLower === 'h') toggleHud();
     else if (keyLower === 'm') toggleMute();
+    else if (keyLower === 'q') toggleDrsMode();
     else if (keyLower === 'r') void startDemoFrom(0);
     else if (keyLower === 'l') {
       if (userTripOverride === null || userTripOverride < 1.2) {
@@ -488,12 +714,11 @@ async function bootstrap(): Promise<void> {
   window.addEventListener('resize', () => {
     const w = Math.max(1, window.innerWidth);
     const h = Math.max(1, window.innerHeight);
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
-    camera.aspect = w / h;
-    camera.updateProjectionMatrix();
-    renderer.setSize(w, h);
-    post.setSize(w, h);
-    hud.resize();
+    const nativeDpr = getNativeDpr();
+    const minDpr = getMinAutoDpr(nativeDpr);
+    const nextDpr = drsMode === 'native' ? nativeDpr : quantiseDpr(appliedDpr, minDpr, nativeDpr);
+    applyViewportResolution(w, h, nextDpr);
+    resetDrsWindow(0.6);
   });
 
   // ------------------------------------------------------------------
@@ -560,11 +785,14 @@ async function bootstrap(): Promise<void> {
       heroForward,
     );
 
-    // Pulse monolith energy conduits & rim illumination cleanly with bass/beat transients
+    // Pulse monolith energy conduits (only once revealed) & rim illumination cleanly with bass/beat transients
     const monolithPulse = audioBass * 0.24 + audioBeat * 0.48;
     if (monolithPulse > 0.001) {
       for (let i = 0; i < monolithConduitMats.length; i++) {
-        monolithConduitMats[i].uniforms.uLightning.value += monolithPulse;
+        const uniforms = monolithConduitMats[i].uniforms;
+        if (uniforms.uReveal.value > 0.005) {
+          uniforms.uLightning.value += monolithPulse;
+        }
       }
       env.rimLight.intensity += audioBass * 0.35 + audioBeat * 0.55;
     }
@@ -765,6 +993,7 @@ async function bootstrap(): Promise<void> {
     seek(t: number) {
       const targetT = THREE.MathUtils.clamp(Number(t) || 0, 0, TOTAL_DURATION);
       choreography.reset(targetT);
+      resetDrsWindow(0.4);
       applySceneFrame(0.016, targetT, false, true);
       syncTimelineDom(choreography.currentTime, true);
     },
@@ -773,6 +1002,50 @@ async function bootstrap(): Promise<void> {
     },
     sampleCanvasStats,
   });
+
+  // ------------------------------------------------------------------
+  // 5. ASYNC SHADER PRE-WARM & MAIN ANIMATION LOOP
+  // ------------------------------------------------------------------
+  // Pre-compile all scene materials once against the HalfFloat EffectComposer target
+  // via KHR_parallel_shader_compile with constant PointLight count so Act I–V
+  // transitions suffer zero shader-compile stutter.
+  updateLaunchStatus();
+  syncConstantPointLightCount();
+  const prevCompileTarget = renderer.getRenderTarget();
+  renderer.setRenderTarget(post.composer.renderTarget1);
+  try {
+    await renderer.compileAsync(scene, camera);
+  } catch {
+    // Graceful fallback if driver lacks parallel compile support
+  } finally {
+    renderer.setRenderTarget(prevCompileTarget);
+  }
+  shadersCompiled = true;
+  updateLaunchStatus();
+
+  // Warm up offscreen cloud pass and fused post-processing passes once before frame timing starts,
+  // unless playback was already engaged while async shader compilation was in flight.
+  if (!hasLaunched) {
+    choreography.currentTime = 4.2;
+    const warmupState = choreography.update(0.016, 0, camera, 'cinematic', 0.12, false);
+    lastTripIntensity = warmupState.tripIntensity;
+    heroForward.set(0, 0, -1).applyQuaternion(choreography.hero.group.quaternion);
+    env.setHeroPosition(choreography.hero.group.position, heroForward);
+    env.update(
+      0,
+      0.016,
+      camera.position,
+      0.08,
+      warmupState.tripIntensity,
+      0,
+      choreography.hero.group.position,
+      heroForward,
+    );
+    vfx.update(0.016, 0, camera, warmupState.tripIntensity, 0.3);
+    post.update(0, warmupState.tripIntensity, 0, 0.2);
+    renderPostFrame();
+  }
+
   Object.defineProperty(window, '__DOGFIGHT_DEBUG__', {
     value: debugApi,
     writable: false,
@@ -780,9 +1053,6 @@ async function bootstrap(): Promise<void> {
     enumerable: true,
   });
 
-  // ------------------------------------------------------------------
-  // 5. MAIN ANIMATION LOOP
-  // ------------------------------------------------------------------
   let lastNow = -1;
   let fpsAccum = 0;
   let fpsFrames = 0;
@@ -791,8 +1061,9 @@ async function bootstrap(): Promise<void> {
     requestAnimationFrame(animate);
 
     let rawDt = 0.016;
+    let frameMs = 0;
     if (lastNow >= 0) {
-      const frameMs = now - lastNow;
+      frameMs = now - lastNow;
       if (frameMs > 0 && frameMs < 5000) {
         frameDeltaRing[frameRingHead] = frameMs;
         frameRingHead = (frameRingHead + 1) % FRAME_RING_CAPACITY;
@@ -805,12 +1076,15 @@ async function bootstrap(): Promise<void> {
     lastNow = now;
     const realTime = now / 1000;
 
+    // Adaptive Dynamic Resolution Scaler (hysteresis-guarded, zero allocations)
+    updateDrs(frameMs, realTime);
+
     // FPS counter
     fpsAccum += rawDt;
     fpsFrames++;
     if (fpsAccum >= 0.5) {
       currentFps = Math.round(fpsFrames / fpsAccum);
-      perfReadout.textContent = `${currentFps} FPS`;
+      updatePerfReadout();
       fpsAccum = 0;
       fpsFrames = 0;
     }

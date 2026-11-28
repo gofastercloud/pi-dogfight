@@ -3,6 +3,26 @@ import { FighterJet } from '../aircraft/FighterJet';
 
 const GUN_MUZZLE_SPEED = 920; // World units/s for M61A1 20mm Vulcan lead calculation
 const RWR_MAX_RANGE = 1450;   // World units mapped to the outer RWR threat ring
+const LEAD_TETHER_DASH = [4, 4];
+
+const HUD_FONT_COMPACT = '600 10px "SF Mono", "Fira Code", ui-monospace, monospace';
+const HUD_FONT_NORMAL = '600 11px "SF Mono", "Fira Code", ui-monospace, monospace';
+const RWR_FONT = '600 9.5px "SF Mono", "Fira Code", ui-monospace, monospace';
+const WPN_MISSILE_LABEL = 'WPN  AIM-9X PRISM';
+const WPN_GUN_LABEL = 'WPN  M61A1 VULCAN';
+
+// Pre-computed 000–359 compass tape labels (zero per-frame string allocations)
+const DEGREE_LABELS: readonly string[] = Array.from({ length: 360 }, (_, deg) =>
+  String(deg).padStart(3, '0'),
+);
+
+interface BanditHudLabelCache {
+  callsign: string;
+  shortTag: string;
+  distTenths: number;
+  onScreenLabel: string;
+  offScreenLabel: string;
+}
 
 export class FighterHUD {
   private readonly canvas: HTMLCanvasElement;
@@ -12,6 +32,34 @@ export class FighterHUD {
   private viewW = 1280;
   private viewH = 720;
   private smoothedGLoad = 0;
+
+  // Cached formatted HUD strings so unchanged telemetry avoids per-frame allocations
+  private lastGKey = -1;
+  private cachedGMidStop = 'rgba(6, 3, 14, 0.000)';
+  private cachedGOutStop = 'rgba(2, 1, 8, 0.000)';
+  private lastHueKey = -1;
+  private lastAlphaKey = -1;
+  private cachedPrimary = 'hsla(152, 96%, 64%, 0.84)';
+  private cachedFaint = 'hsla(152, 96%, 64%, 0.34)';
+  private lastKnots = -1;
+  private cachedKnotsStr = 'IAS  0 KT';
+  private lastMachHundredths = -1;
+  private cachedMachStr = 'MACH 0.00';
+  private lastGTenths = Number.NaN;
+  private cachedGStr = 'G    +1.0';
+  private lastThrPct = -1;
+  private cachedThrStr = 'THR  100% AB';
+  private lastTimePct = -1;
+  private cachedTimeStr = 'TIME 100% BULLET';
+  private lastAltFt = -1;
+  private cachedAltStr = 'ALT  0 FT';
+  private lastCameraTag = '';
+  private cachedCamTagStr = 'CAM: ';
+  private lastFluxPct = -1;
+  private cachedFluxStr = 'FLUX 0%';
+  private lastRwrThreatCount = -1;
+  private cachedRwrStr = 'RWR · 0 TRK';
+  private readonly banditLabelCache: BanditHudLabelCache[] = [];
 
   // Pre-allocated scratch math objects (zero per-frame heap allocations)
   private readonly euler = new THREE.Euler();
@@ -71,21 +119,35 @@ export class FighterHUD {
 
     if (this.smoothedGLoad > 0.004) {
       const g = this.smoothedGLoad;
+      const gKey = Math.round(g * 200);
+      if (gKey !== this.lastGKey) {
+        this.lastGKey = gKey;
+        this.cachedGMidStop = `rgba(6, 3, 14, ${(0.22 * g).toFixed(3)})`;
+        this.cachedGOutStop = `rgba(2, 1, 8, ${(0.58 * g).toFixed(3)})`;
+      }
       const innerR = Math.min(w, h) * (0.44 - g * 0.11);
       const outerR = Math.hypot(cx, cy) * 1.04;
       const grad = ctx.createRadialGradient(cx, cy, innerR, cx, cy, outerR);
       grad.addColorStop(0, 'rgba(4, 2, 10, 0)');
-      grad.addColorStop(0.62, `rgba(6, 3, 14, ${(0.22 * g).toFixed(3)})`);
-      grad.addColorStop(1, `rgba(2, 1, 8, ${(0.58 * g).toFixed(3)})`);
+      grad.addColorStop(0.62, this.cachedGMidStop);
+      grad.addColorStop(1, this.cachedGOutStop);
       ctx.fillStyle = grad;
       ctx.fillRect(0, 0, w, h);
     }
 
     // Colour shifts subtly from military phosphor green -> chromatic neon cyan/magenta during LSD peak
     const hue = tripIntensity > 0.35 ? (152 + Math.sin(time * 2.4) * 95 * tripIntensity + 360) % 360 : 152;
-    const pulseAlpha = Math.min(0.98, 0.84 + beatPulse * 0.12);
-    const primary = `hsla(${hue}, 96%, 64%, ${pulseAlpha.toFixed(2)})`;
-    const faint = `hsla(${hue}, 96%, 64%, 0.34)`;
+    const hueKey = Math.round(hue * 2);
+    const alphaKey = Math.round(Math.min(0.98, 0.84 + beatPulse * 0.12) * 100);
+    if (hueKey !== this.lastHueKey || alphaKey !== this.lastAlphaKey) {
+      this.lastHueKey = hueKey;
+      this.lastAlphaKey = alphaKey;
+      const hueVal = hueKey * 0.5;
+      this.cachedPrimary = `hsla(${hueVal}, 96%, 64%, ${(alphaKey * 0.01).toFixed(2)})`;
+      this.cachedFaint = `hsla(${hueVal}, 96%, 64%, 0.34)`;
+    }
+    const primary = this.cachedPrimary;
+    const faint = this.cachedFaint;
     const alert = isMissileLocked ? 'rgba(255, 58, 92, 0.95)' : 'rgba(255, 196, 70, 0.88)';
 
     // Subtle psychedelic instrument jitter when trip > 0.55 ("Instruments are melting!")
@@ -97,9 +159,7 @@ export class FighterHUD {
     ctx.strokeStyle = primary;
     ctx.fillStyle = primary;
     ctx.lineWidth = 1.4;
-    ctx.font = isCompact
-      ? '600 10px "SF Mono", "Fira Code", ui-monospace, monospace'
-      : '600 11px "SF Mono", "Fira Code", ui-monospace, monospace';
+    ctx.font = isCompact ? HUD_FONT_COMPACT : HUD_FONT_NORMAL;
 
     // ------------------------------------------------------------------
     // 1. CENTRAL PITCH LADDER & FLIGHT PATH VECTOR (TILTS WITH VIPER-1 ROLL)
@@ -167,61 +227,96 @@ export class FighterHUD {
 
     ctx.textAlign = 'center';
     for (let offset = -30; offset <= 30; offset += 10) {
-      const degVal = Math.round((headingDeg + offset + 360) % 360);
+      const degVal = ((Math.round(headingDeg + offset) % 360) + 360) % 360;
       const tx = cx + (offset / 35) * (tapeW * 0.5);
       ctx.beginPath();
       ctx.moveTo(tx, tapeY - 5);
       ctx.lineTo(tx, tapeY + 4);
       ctx.stroke();
-      ctx.fillText(String(degVal).padStart(3, '0'), tx, tapeY - 9);
+      ctx.fillText(DEGREE_LABELS[degVal], tx, tapeY - 9);
     }
 
     ctx.strokeStyle = primary;
     ctx.strokeRect(cx - 22, tapeY + 7, 44, 18);
-    ctx.fillText(String(Math.round(headingDeg)).padStart(3, '0'), cx, tapeY + 20);
+    const headIdx = ((Math.round(headingDeg) % 360) + 360) % 360;
+    ctx.fillText(DEGREE_LABELS[headIdx], cx, tapeY + 20);
 
     // ------------------------------------------------------------------
     // 3. LEFT AIRSPEED / MACH / G-FORCE TELEMETRY COLUMN
     // ------------------------------------------------------------------
     const leftX = Math.max(20, w * 0.042);
-    const mach = (hero.speed / 128).toFixed(2);
+    const machHundredths = Math.round((hero.speed / 128) * 100);
+    if (machHundredths !== this.lastMachHundredths) {
+      this.lastMachHundredths = machHundredths;
+      this.cachedMachStr = `MACH ${(machHundredths * 0.01).toFixed(2)}`;
+    }
     const knots = Math.round(hero.speed * 3.4);
+    if (knots !== this.lastKnots) {
+      this.lastKnots = knots;
+      this.cachedKnotsStr = `IAS  ${knots} KT`;
+    }
+    const gTenths = Math.round(hero.gForce * 10);
+    const isOverG = gTenths >= 90;
+    if (gTenths !== this.lastGTenths) {
+      this.lastGTenths = gTenths;
+      const gText = (gTenths * 0.1).toFixed(1);
+      this.cachedGStr = isOverG ? `G    +${gText} OVER-G` : `G    +${gText}`;
+    }
+    const thrPct = Math.round(hero.throttle * 100);
+    if (thrPct !== this.lastThrPct) {
+      this.lastThrPct = thrPct;
+      this.cachedThrStr = `THR  ${thrPct}% AB`;
+    }
     const altFt = Math.max(0, Math.round(hero.group.position.y * 28));
+    if (altFt !== this.lastAltFt) {
+      this.lastAltFt = altFt;
+      this.cachedAltStr = `ALT  ${altFt.toLocaleString()} FT`;
+    }
 
     ctx.textAlign = 'left';
     ctx.fillStyle = primary;
-    ctx.fillText(`IAS  ${knots} KT`, leftX, cy - 42);
-    ctx.fillText(`MACH ${mach}`, leftX, cy - 24);
-    ctx.fillStyle = hero.gForce >= 9.0 ? 'rgba(255, 76, 98, 0.96)' : primary;
-    ctx.fillText(
-      hero.gForce >= 9.0 ? `G    +${hero.gForce.toFixed(1)} OVER-G` : `G    +${hero.gForce.toFixed(1)}`,
-      leftX,
-      cy - 6,
-    );
+    ctx.fillText(this.cachedKnotsStr, leftX, cy - 42);
+    ctx.fillText(this.cachedMachStr, leftX, cy - 24);
+    ctx.fillStyle = isOverG ? 'rgba(255, 76, 98, 0.96)' : primary;
+    ctx.fillText(this.cachedGStr, leftX, cy - 6);
     ctx.fillStyle = primary;
-    ctx.fillText(`THR  ${Math.round(hero.throttle * 100)}% AB`, leftX, cy + 12);
+    ctx.fillText(this.cachedThrStr, leftX, cy + 12);
     if (timeScale < 0.7) {
+      const timePct = Math.round(timeScale * 100);
+      if (timePct !== this.lastTimePct) {
+        this.lastTimePct = timePct;
+        this.cachedTimeStr = `TIME ${timePct}% BULLET`;
+      }
       ctx.fillStyle = '#ff66dd';
-      ctx.fillText(`TIME ${(timeScale * 100).toFixed(0)}% BULLET`, leftX, cy + 32);
+      ctx.fillText(this.cachedTimeStr, leftX, cy + 32);
     }
 
     // ------------------------------------------------------------------
     // 4. RIGHT ALTITUDE / WEAPONS / CAMERA TAG COLUMN
     // ------------------------------------------------------------------
     const rightX = w - Math.max(20, w * 0.042);
+    if (cameraTag !== this.lastCameraTag) {
+      this.lastCameraTag = cameraTag;
+      this.cachedCamTagStr = `CAM: ${cameraTag}`;
+    }
     ctx.textAlign = 'right';
     ctx.fillStyle = primary;
-    ctx.fillText(`ALT  ${altFt.toLocaleString()} FT`, rightX, cy - 42);
-    ctx.fillText(`WPN  ${isMissileLocked ? 'AIM-9X PRISM' : 'M61A1 VULCAN'}`, rightX, cy - 24);
+    ctx.fillText(this.cachedAltStr, rightX, cy - 42);
+    ctx.fillText(isMissileLocked ? WPN_MISSILE_LABEL : WPN_GUN_LABEL, rightX, cy - 24);
     ctx.fillStyle = alert;
-    ctx.fillText(`CAM: ${cameraTag}`, rightX, cy - 6);
+    ctx.fillText(this.cachedCamTagStr, rightX, cy - 6);
     if (isMissileLocked) {
       ctx.fillStyle = 'rgba(255, 58, 92, 0.95)';
       ctx.fillText('LOCK: SHOOT', rightX, cy + 30);
     }
     if (tripIntensity > 0.2) {
+      const fluxPct = Math.round(tripIntensity * 100);
+      if (fluxPct !== this.lastFluxPct) {
+        this.lastFluxPct = fluxPct;
+        this.cachedFluxStr = `FLUX ${fluxPct}%`;
+      }
       ctx.fillStyle = '#ff7ae5';
-      ctx.fillText(`FLUX ${Math.round(tripIntensity * 100)}%`, rightX, cy + 12);
+      ctx.fillText(this.cachedFluxStr, rightX, cy + 12);
     }
 
     // ------------------------------------------------------------------
@@ -259,7 +354,30 @@ export class FighterHUD {
 
       const isLocked = b === lockedTarget;
       const dist = b.group.position.distanceTo(hero.group.position);
-      const distKm = (dist / 140).toFixed(1);
+      const distTenths = Math.round((dist / 140) * 10);
+      let labelCache = this.banditLabelCache[i];
+      if (!labelCache) {
+        const shortTag = b.role === 'ace' ? 'ACE' : b.callsign.replace('WRAITH-', 'W');
+        const distKm = (distTenths * 0.1).toFixed(1);
+        labelCache = {
+          callsign: b.callsign,
+          shortTag,
+          distTenths,
+          onScreenLabel: `${b.callsign} · ${distKm}KM`,
+          offScreenLabel: `${shortTag} ${distKm}K`,
+        };
+        this.banditLabelCache[i] = labelCache;
+      } else if (labelCache.callsign !== b.callsign || labelCache.distTenths !== distTenths) {
+        if (labelCache.callsign !== b.callsign) {
+          labelCache.callsign = b.callsign;
+          labelCache.shortTag = b.role === 'ace' ? 'ACE' : b.callsign.replace('WRAITH-', 'W');
+        }
+        labelCache.distTenths = distTenths;
+        const distKm = (distTenths * 0.1).toFixed(1);
+        labelCache.onScreenLabel = `${b.callsign} · ${distKm}KM`;
+        labelCache.offScreenLabel = `${labelCache.shortTag} ${distKm}K`;
+      }
+
       const boxCol =
         isLocked && isMissileLocked
           ? 'rgba(255, 48, 86, 0.96)'
@@ -300,7 +418,7 @@ export class FighterHUD {
         }
 
         ctx.textAlign = 'center';
-        ctx.fillText(`${b.callsign} · ${distKm}KM`, sx, sy - r - 7);
+        ctx.fillText(labelCache.onScreenLabel, sx, sy - r - 7);
       } else {
         // Off-boresight edge-of-screen directional chevron arrow via camera-space vector
         this.camSpacePos.copy(b.group.position).applyMatrix4(camera.matrixWorldInverse);
@@ -353,10 +471,9 @@ export class FighterHUD {
         // Inset compact distance/callsign tag toward screen centre so it stays inside bounds
         const labelX = ax - dirX * 26;
         const labelY = ay - dirY * 18 + 3;
-        const shortTag = b.role === 'ace' ? 'ACE' : b.callsign.replace('WRAITH-', 'W');
         ctx.fillStyle = boxCol;
         ctx.textAlign = 'center';
-        ctx.fillText(`${shortTag} ${distKm}K`, labelX, labelY);
+        ctx.fillText(labelCache.offScreenLabel, labelX, labelY);
       }
     }
 
@@ -392,7 +509,7 @@ export class FighterHUD {
               ctx.save();
               ctx.strokeStyle = faint;
               ctx.lineWidth = 1.0;
-              ctx.setLineDash([4, 4]);
+              ctx.setLineDash(LEAD_TETHER_DASH);
               ctx.beginPath();
               ctx.moveTo(activeScreenX, activeScreenY);
               ctx.lineTo(lx, ly);
@@ -577,10 +694,14 @@ export class FighterHUD {
     }
 
     // Compact RWR status caption beneath scope
+    if (threatCount !== this.lastRwrThreatCount) {
+      this.lastRwrThreatCount = threatCount;
+      this.cachedRwrStr = `RWR · ${threatCount} TRK`;
+    }
     ctx.fillStyle = threatCount > 0 && isMissileLocked ? 'rgba(255, 58, 92, 0.95)' : primary;
     ctx.textAlign = 'center';
-    ctx.font = '600 9.5px "SF Mono", "Fira Code", ui-monospace, monospace';
-    ctx.fillText(`RWR · ${threatCount} TRK`, rx, ry + r + 13);
+    ctx.font = RWR_FONT;
+    ctx.fillText(this.cachedRwrStr, rx, ry + r + 13);
 
     ctx.restore();
   }
