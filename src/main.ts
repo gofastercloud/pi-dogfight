@@ -282,13 +282,19 @@ async function bootstrap(): Promise<void> {
     }
     if (dprChanged) {
       renderer.setPixelRatio(safeDpr);
-      // Sync EffectComposer's internal pixel ratio once before updating final-pass uniforms
-      post.composer.setPixelRatio(safeDpr);
+      // Sync EffectComposer's internal pixel ratio before a single post.setSize() call
+      // so simultaneous viewport + DPR changes never trigger double FBO reallocations.
+      const composerInternal = post.composer as unknown as { _pixelRatio?: number };
+      if (typeof composerInternal._pixelRatio === 'number') {
+        composerInternal._pixelRatio = safeDpr;
+      } else {
+        post.composer.setPixelRatio(safeDpr);
+      }
     }
     if (sizeChanged) {
       renderer.setSize(safeW, safeH);
     }
-    // RenderTarget.setSize is a no-op when dimensions already match, avoiding redundant texture reallocations
+    // Single pass resize (RenderTarget.setSize is a no-op when dimensions already match)
     post.setSize(safeW, safeH);
     if (sizeChanged) {
       hud.resize();
@@ -1017,25 +1023,28 @@ async function bootstrap(): Promise<void> {
   shadersCompiled = true;
   updateLaunchStatus();
 
-  // Warm up offscreen cloud pass and fused post-processing passes once before frame timing starts
-  choreography.currentTime = 4.2;
-  const warmupState = choreography.update(0.016, 0, camera, 'cinematic', 0.12, false);
-  lastTripIntensity = warmupState.tripIntensity;
-  heroForward.set(0, 0, -1).applyQuaternion(choreography.hero.group.quaternion);
-  env.setHeroPosition(choreography.hero.group.position, heroForward);
-  env.update(
-    0,
-    0.016,
-    camera.position,
-    0.08,
-    warmupState.tripIntensity,
-    0,
-    choreography.hero.group.position,
-    heroForward,
-  );
-  vfx.update(0.016, 0, camera, warmupState.tripIntensity, 0.3);
-  post.update(0, warmupState.tripIntensity, 0, 0.2);
-  renderPostFrame();
+  // Warm up offscreen cloud pass and fused post-processing passes once before frame timing starts,
+  // unless playback was already engaged while async shader compilation was in flight.
+  if (!hasLaunched) {
+    choreography.currentTime = 4.2;
+    const warmupState = choreography.update(0.016, 0, camera, 'cinematic', 0.12, false);
+    lastTripIntensity = warmupState.tripIntensity;
+    heroForward.set(0, 0, -1).applyQuaternion(choreography.hero.group.quaternion);
+    env.setHeroPosition(choreography.hero.group.position, heroForward);
+    env.update(
+      0,
+      0.016,
+      camera.position,
+      0.08,
+      warmupState.tripIntensity,
+      0,
+      choreography.hero.group.position,
+      heroForward,
+    );
+    vfx.update(0.016, 0, camera, warmupState.tripIntensity, 0.3);
+    post.update(0, warmupState.tripIntensity, 0, 0.2);
+    renderPostFrame();
+  }
 
   Object.defineProperty(window, '__DOGFIGHT_DEBUG__', {
     value: debugApi,

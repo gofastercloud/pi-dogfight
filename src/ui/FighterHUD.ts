@@ -256,10 +256,11 @@ export class FighterHUD {
       this.cachedKnotsStr = `IAS  ${knots} KT`;
     }
     const gTenths = Math.round(hero.gForce * 10);
+    const isOverG = gTenths >= 90;
     if (gTenths !== this.lastGTenths) {
       this.lastGTenths = gTenths;
       const gText = (gTenths * 0.1).toFixed(1);
-      this.cachedGStr = gTenths >= 90 ? `G    +${gText} OVER-G` : `G    +${gText}`;
+      this.cachedGStr = isOverG ? `G    +${gText} OVER-G` : `G    +${gText}`;
     }
     const thrPct = Math.round(hero.throttle * 100);
     if (thrPct !== this.lastThrPct) {
@@ -276,7 +277,7 @@ export class FighterHUD {
     ctx.fillStyle = primary;
     ctx.fillText(this.cachedKnotsStr, leftX, cy - 42);
     ctx.fillText(this.cachedMachStr, leftX, cy - 24);
-    ctx.fillStyle = hero.gForce >= 9.0 ? 'rgba(255, 76, 98, 0.96)' : primary;
+    ctx.fillStyle = isOverG ? 'rgba(255, 76, 98, 0.96)' : primary;
     ctx.fillText(this.cachedGStr, leftX, cy - 6);
     ctx.fillStyle = primary;
     ctx.fillText(this.cachedThrStr, leftX, cy + 12);
