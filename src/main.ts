@@ -36,8 +36,25 @@ export interface DogfightDebugState {
   readonly audioBeat: number;
 }
 
+export type DrsMode = 'auto' | 'native';
+
+export interface DogfightPerfStats {
+  drawCalls: number;
+  triangles: number;
+  programs: number;
+  geometries: number;
+  textures: number;
+  pixelRatio: number;
+  drsMode: DrsMode;
+  frameMsP50: number;
+  frameMsP95: number;
+  frameMsP99: number;
+  fps: number;
+}
+
 export interface DogfightDebugApi extends DogfightDebugState {
   getState(): DogfightDebugState;
+  getPerfStats(): DogfightPerfStats;
   seek(t: number): void;
   setCamera(mode: CameraMode): void;
   sampleCanvasStats(): DogfightCanvasStats;
@@ -102,6 +119,7 @@ async function bootstrap(): Promise<void> {
   renderer.setSize(window.innerWidth, window.innerHeight);
   renderer.toneMapping = THREE.NoToneMapping; // ACES applied in our custom final shader pass
   renderer.outputColorSpace = THREE.SRGBColorSpace;
+  renderer.info.autoReset = false; // Manually reset once per composed frame for accurate multi-pass telemetry
 
   const scene = new THREE.Scene();
   scene.fog = new THREE.FogExp2(0x281c28, 0.00018);
@@ -177,11 +195,23 @@ async function bootstrap(): Promise<void> {
   let lastDisplayedSec = -1;
   let lastScrubberVal = -1;
 
-  // Pre-allocated scratch vectors (zero per-frame heap allocations in animate loop)
+  // Pre-allocated scratch vectors & frame-delta ring buffer (zero per-frame heap allocations)
   const orbitOffset = new THREE.Vector3(42, 18, 46);
   const prevOrbitHeroPos = new THREE.Vector3();
   const heroDelta = new THREE.Vector3();
   const heroForward = new THREE.Vector3(0, 0, -1);
+
+  const FRAME_RING_CAPACITY = 120;
+  const frameDeltaRing = new Float64Array(FRAME_RING_CAPACITY);
+  const frameSortScratch = new Float64Array(FRAME_RING_CAPACITY);
+  let frameRingHead = 0;
+  let frameRingCount = 0;
+  const drsMode: DrsMode = 'native';
+
+  const renderPostFrame = () => {
+    renderer.info.reset();
+    post.render();
+  };
 
   const syncTimelineDom = (sec: number, force = false) => {
     const wholeSec = Math.max(0, Math.floor(sec));
@@ -560,13 +590,13 @@ async function bootstrap(): Promise<void> {
       post.bloomPass.strength += audioBass * 0.10 + audioBeat * 0.16;
       post.anamorphicPass.intensity += audioBeat * 0.10 + audioMid * 0.05;
     }
-    post.render();
+    renderPostFrame();
     renderHudNow(realTime, tripIntensity);
   };
 
   let pixelReadBuf: Uint8Array | null = null;
   const sampleCanvasStats = (): DogfightCanvasStats => {
-    post.render();
+    renderPostFrame();
     const gl = renderer.getContext();
     const w = gl.drawingBufferWidth;
     const h = gl.drawingBufferHeight;
@@ -646,6 +676,53 @@ async function bootstrap(): Promise<void> {
     audioBeat: audio.beatPulse,
   });
 
+  const getPerfStats = (): DogfightPerfStats => {
+    const n = frameRingCount;
+    let frameMsP50 = 0;
+    let frameMsP95 = 0;
+    let frameMsP99 = 0;
+    let fps = currentFps;
+
+    if (n > 0) {
+      let sum = 0;
+      for (let i = 0; i < n; i++) {
+        const v = frameDeltaRing[i];
+        frameSortScratch[i] = v;
+        sum += v;
+      }
+      // In-place insertion sort on pre-allocated scratch buffer (n <= 120)
+      for (let i = 1; i < n; i++) {
+        const key = frameSortScratch[i];
+        let j = i - 1;
+        while (j >= 0 && frameSortScratch[j] > key) {
+          frameSortScratch[j + 1] = frameSortScratch[j];
+          j--;
+        }
+        frameSortScratch[j + 1] = key;
+      }
+      frameMsP50 = frameSortScratch[Math.min(n - 1, Math.max(0, Math.ceil(0.5 * n) - 1))];
+      frameMsP95 = frameSortScratch[Math.min(n - 1, Math.max(0, Math.ceil(0.95 * n) - 1))];
+      frameMsP99 = frameSortScratch[Math.min(n - 1, Math.max(0, Math.ceil(0.99 * n) - 1))];
+      const meanMs = sum / n;
+      fps = meanMs > 0 ? 1000 / meanMs : currentFps;
+    }
+
+    const info = renderer.info;
+    return {
+      drawCalls: info.render.calls,
+      triangles: info.render.triangles,
+      programs: info.programs ? info.programs.length : 0,
+      geometries: info.memory.geometries,
+      textures: info.memory.textures,
+      pixelRatio: renderer.getPixelRatio(),
+      drsMode,
+      frameMsP50,
+      frameMsP95,
+      frameMsP99,
+      fps,
+    };
+  };
+
   const debugApi: DogfightDebugApi = Object.freeze({
     get currentTime() {
       return choreography.currentTime;
@@ -684,6 +761,7 @@ async function bootstrap(): Promise<void> {
       return audio.beatPulse;
     },
     getState: readState,
+    getPerfStats,
     seek(t: number) {
       const targetT = THREE.MathUtils.clamp(Number(t) || 0, 0, TOTAL_DURATION);
       choreography.reset(targetT);
@@ -705,14 +783,25 @@ async function bootstrap(): Promise<void> {
   // ------------------------------------------------------------------
   // 5. MAIN ANIMATION LOOP
   // ------------------------------------------------------------------
-  let lastNow = performance.now();
+  let lastNow = -1;
   let fpsAccum = 0;
   let fpsFrames = 0;
 
   const animate = (now: number) => {
     requestAnimationFrame(animate);
 
-    const rawDt = Math.min((now - lastNow) / 1000, 0.08);
+    let rawDt = 0.016;
+    if (lastNow >= 0) {
+      const frameMs = now - lastNow;
+      if (frameMs > 0 && frameMs < 5000) {
+        frameDeltaRing[frameRingHead] = frameMs;
+        frameRingHead = (frameRingHead + 1) % FRAME_RING_CAPACITY;
+        if (frameRingCount < FRAME_RING_CAPACITY) {
+          frameRingCount++;
+        }
+      }
+      rawDt = Math.min(Math.max(frameMs, 0) / 1000, 0.08);
+    }
     lastNow = now;
     const realTime = now / 1000;
 
@@ -745,7 +834,7 @@ async function bootstrap(): Promise<void> {
       );
       vfx.update(rawDt, realTime, camera, tripIntensity, 0.3);
       post.update(realTime, tripIntensity, 0, 0.2);
-      post.render();
+      renderPostFrame();
       return;
     }
 
