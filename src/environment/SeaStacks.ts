@@ -2,6 +2,10 @@ import * as THREE from 'three';
 
 const BASALT_VERT = /* glsl */ `
   attribute float aColumnAO;
+  attribute vec2 aColumnMod; // x: per-column hash [0, 1], y: rigid upper-column height span
+  #ifdef USE_INSTANCING
+    attribute float aStackSeed;
+  #endif
 
   varying vec3 vWorldPos;
   varying vec3 vWorldNormal;
@@ -13,12 +17,15 @@ const BASALT_VERT = /* glsl */ `
   }
 
   void main() {
+    vec3 localPos = position;
     mat4 worldMat = modelMatrix;
     #ifdef USE_INSTANCING
+      // Rigid vertical column-height modulation varies every sea-stack skyline in 1 instanced draw
+      localPos.y += aColumnMod.y * sin(aColumnMod.x * 6.2831853 + aStackSeed * 4.712389);
       worldMat = modelMatrix * instanceMatrix;
     #endif
 
-    vec4 wp = worldMat * vec4(position, 1.0);
+    vec4 wp = worldMat * vec4(localPos, 1.0);
     vWorldPos = wp.xyz;
 
     // Exact 3x3 cofactor transform preserves outward normals under non-uniform instance scale
@@ -80,31 +87,84 @@ const BASALT_FRAG = /* glsl */ `
     return vec3(val, grad);
   }
 
-  float fbm2(vec2 p) {
-    float v = 0.0;
-    float a = 0.5;
-    mat2 rot = mat2(0.8, 0.6, -0.6, 0.8);
-    for (int i = 0; i < 3; i++) {
-      v += a * noise2Grad(p).x;
-      p = rot * p * 2.04;
-      a *= 0.5;
+  // Distance-LOD mineral fBM: smoothly tapers octaves 3 -> 2 -> 1 -> neutral mean
+  float fbm2Lod(vec2 p, float coarseLod, float fineLod) {
+    if (coarseLod <= 0.002) {
+      return 0.4375;
     }
-    return v;
+    mat2 rot = mat2(0.8, 0.6, -0.6, 0.8);
+    float v = noise2Grad(p).x;
+    float wSum = 1.0;
+
+    float w2 = smoothstep(0.15, 0.75, coarseLod);
+    if (w2 > 0.002) {
+      p = rot * p * 2.04;
+      float a2 = 0.5 * w2;
+      v += a2 * noise2Grad(p).x;
+      wSum += a2;
+
+      if (fineLod > 0.002) {
+        p = rot * p * 2.04;
+        float a3 = 0.25 * fineLod;
+        v += a3 * noise2Grad(p).x;
+        wSum += a3;
+      }
+    }
+    float sampled = (v / max(wSum, 1e-4)) * 0.875;
+    return mix(0.4375, sampled, coarseLod);
   }
 
-  // Tri-planar rock detail & strata sampler: returns (heightVal, strataVal, mineralVal)
-  vec3 sampleTriplanarRock(vec3 wp, vec3 triW, out vec3 bumpGrad) {
-    // Low-frequency volcanic fracture + medium rock grain across XY, ZY, XZ planes
-    vec3 nXY = noise2Grad(wp.xy * 0.042);
-    vec3 nZY = noise2Grad(wp.zy * 0.042);
-    vec3 nXZ = noise2Grad(wp.xz * 0.042);
+  // Distance-faded tri-planar rock detail & strata sampler: returns (heightVal, strataVal, mineralVal)
+  vec3 sampleTriplanarRock(vec3 wp, vec3 triW, float coarseLod, float fineLod, out vec3 bumpGrad) {
+    float coarse = 0.5;
+    float fine = 0.5;
+    vec3 coarseGrad = vec3(0.0);
+    vec3 fineGrad = vec3(0.0);
 
-    vec3 mXY = noise2Grad(wp.xy * 0.165 + vec2(11.3, 4.7));
-    vec3 mZY = noise2Grad(wp.zy * 0.165 + vec2(7.1, 19.2));
-    vec3 mXZ = noise2Grad(wp.xz * 0.165 + vec2(3.4, 8.9));
+    // Low-frequency volcanic fracture octave across significant tri-planar axes only
+    if (coarseLod > 0.002) {
+      float coarseSum = 0.5;
+      if (triW.z > 0.015) {
+        vec3 nXY = noise2Grad(wp.xy * 0.042);
+        coarseSum += (nXY.x - 0.5) * triW.z;
+        coarseGrad += vec3(nXY.y, nXY.z, 0.0) * triW.z;
+      }
+      if (triW.x > 0.015) {
+        vec3 nZY = noise2Grad(wp.zy * 0.042);
+        coarseSum += (nZY.x - 0.5) * triW.x;
+        coarseGrad += vec3(0.0, nZY.z, nZY.y) * triW.x;
+      }
+      if (triW.y > 0.015) {
+        vec3 nXZ = noise2Grad(wp.xz * 0.042);
+        coarseSum += (nXZ.x - 0.5) * triW.y;
+        coarseGrad += vec3(nXZ.y, 0.0, nXZ.z) * triW.y;
+      }
+      coarse = mix(0.5, coarseSum, coarseLod);
+      coarseGrad *= coarseLod;
 
-    float coarse = nXY.x * triW.z + nZY.x * triW.x + nXZ.x * triW.y;
-    float fine = mXY.x * triW.z + mZY.x * triW.x + mXZ.x * triW.y;
+      // High-frequency rock grain octave (smoothly faded & culled beyond mid-distance)
+      if (fineLod > 0.002) {
+        float fineSum = 0.5;
+        if (triW.z > 0.015) {
+          vec3 mXY = noise2Grad(wp.xy * 0.165 + vec2(11.3, 4.7));
+          fineSum += (mXY.x - 0.5) * triW.z;
+          fineGrad += vec3(mXY.y, mXY.z, 0.0) * triW.z;
+        }
+        if (triW.x > 0.015) {
+          vec3 mZY = noise2Grad(wp.zy * 0.165 + vec2(7.1, 19.2));
+          fineSum += (mZY.x - 0.5) * triW.x;
+          fineGrad += vec3(0.0, mZY.z, mZY.y) * triW.x;
+        }
+        if (triW.y > 0.015) {
+          vec3 mXZ = noise2Grad(wp.xz * 0.165 + vec2(3.4, 8.9));
+          fineSum += (mXZ.x - 0.5) * triW.y;
+          fineGrad += vec3(mXZ.y, 0.0, mXZ.z) * triW.y;
+        }
+        fine = mix(0.5, fineSum, fineLod);
+        fineGrad *= 0.55 * fineLod;
+      }
+    }
+
     float rockVal = coarse * 0.65 + fine * 0.35;
 
     // Horizontal columnar basalt cooling joints & volcanic strata bands
@@ -114,16 +174,11 @@ const BASALT_FRAG = /* glsl */ `
     float strata = strataBand * 0.62 + jointGroove * 0.38;
 
     // Mineral / iron-oxide variation
-    float mineral = fbm2(wp.xz * 0.018 + vec2(wp.y * 0.014, -wp.y * 0.009));
+    float mineral = fbm2Lod(wp.xz * 0.018 + vec2(wp.y * 0.014, -wp.y * 0.009), coarseLod, fineLod);
 
-    // World-space tri-planar bump gradient
-    vec3 gradXY = vec3(nXY.y + mXY.y * 0.55, nXY.z + mXY.z * 0.55, 0.0);
-    vec3 gradZY = vec3(0.0, nZY.z + mZY.z * 0.55, nZY.y + mZY.y * 0.55);
-    vec3 gradXZ = vec3(nXZ.y + mXZ.y * 0.55, 0.0, nXZ.z + mXZ.z * 0.55);
-    bumpGrad = gradXY * triW.z + gradZY * triW.x + gradXZ * triW.y;
-
-    // Add subtle horizontal cooling-joint step slope into Y bump gradient
-    bumpGrad.y += cos(wp.y * 0.16 + strataWarp) * 0.26 * (1.0 - triW.y);
+    // World-space tri-planar bump gradient + cooling-joint step slope
+    bumpGrad = coarseGrad + fineGrad;
+    bumpGrad.y += cos(wp.y * 0.16 + strataWarp) * 0.26 * (1.0 - triW.y) * coarseLod;
 
     return vec3(rockVal, strata, mineral);
   }
@@ -135,25 +190,43 @@ const BASALT_FRAG = /* glsl */ `
   }
 
   void main() {
+    float dist = length(cameraPosition - vWorldPos);
+
+    // Seamless atmospheric perspective — early-out past full horizon fog
+    float fogAmt = smoothstep(950.0, 6800.0, dist);
+    vec3 fogCol = mix(vec3(0.82, 0.42, 0.21), vec3(0.18, 0.13, 0.26), uStorm);
+    if (uTrip > 0.05) {
+      fogCol = mix(fogCol, vec3(0.32, 0.09, 0.44), clamp(uTrip * 0.55, 0.0, 0.65));
+    }
+    if (fogAmt >= 0.999) {
+      gl_FragColor = vec4(clamp(fogCol, 0.0, 8.0), 1.0);
+      return;
+    }
+
     vec3 V = safeNormalize(cameraPosition - vWorldPos);
     vec3 L = safeNormalize(uSunDir);
-    float dist = length(cameraPosition - vWorldPos);
 
     vec3 geoN = safeNormalize(vWorldNormal);
     vec3 triW = pow(max(abs(geoN), 1e-4), vec3(4.0));
     triW /= max(triW.x + triW.y + triW.z, 1e-4);
 
+    // Smooth non-inverted distance LOD weights for tri-planar rock octaves
+    float fineLod = 1.0 - smoothstep(650.0, 1850.0, dist);
+    float coarseLod = 1.0 - smoothstep(1800.0, 4400.0, dist);
+    float bumpFade = 1.0 - smoothstep(450.0, 2600.0, dist);
+
     vec3 bumpGrad;
-    vec3 rockSample = sampleTriplanarRock(vWorldPos, triW, bumpGrad);
+    vec3 rockSample = sampleTriplanarRock(vWorldPos, triW, coarseLod, fineLod, bumpGrad);
     float rockVal = rockSample.x;
     float strata = rockSample.y;
     float mineral = rockSample.z;
 
-    // Distance-attenuated tri-planar rock normal perturbation
-    float bumpFade = 1.0 - smoothstep(450.0, 3800.0, dist);
     // Project bump gradient onto surface tangent plane so outward normal remains robust
-    vec3 tangentBump = bumpGrad - geoN * dot(bumpGrad, geoN);
-    vec3 N = safeNormalize(geoN - tangentBump * (0.42 * bumpFade));
+    vec3 N = geoN;
+    if (bumpFade > 0.002) {
+      vec3 tangentBump = bumpGrad - geoN * dot(bumpGrad, geoN);
+      N = safeNormalize(geoN - tangentBump * (0.42 * bumpFade));
+    }
 
     // ------------------------------------------------------------------
     // 1. PROCEDURAL BASALT ALBEDO, STRATA, MINERAL & HIGHLAND MOSS
@@ -257,11 +330,6 @@ const BASALT_FRAG = /* glsl */ `
     col += vec3(1.25, 0.62, 0.25) * albedo * uExplosionFlash * 1.2;
 
     // Seamless atmospheric perspective matching OceanSurface & SkyAndClouds
-    float fogAmt = smoothstep(950.0, 6800.0, dist);
-    vec3 fogCol = mix(vec3(0.82, 0.42, 0.21), vec3(0.18, 0.13, 0.26), uStorm);
-    if (uTrip > 0.05) {
-      fogCol = mix(fogCol, vec3(0.32, 0.09, 0.44), clamp(uTrip * 0.55, 0.0, 0.65));
-    }
     col = mix(col, fogCol, fogAmt);
 
     gl_FragColor = vec4(clamp(col, 0.0, 8.0), 1.0);
@@ -277,6 +345,7 @@ const MIST_VERT = /* glsl */ `
   varying vec2 vUv;
   varying float vSeed;
   varying float vAlpha;
+  varying float vMistDetail;
   varying vec3 vWorldPos;
 
   void main() {
@@ -297,6 +366,14 @@ const MIST_VERT = /* glsl */ `
     float nearFade = smoothstep(32.0, 120.0, camDist);
     float farFade = 1.0 - smoothstep(2200.0, 5600.0, camDist);
     vAlpha = nearFade * farFade * 0.34;
+    vMistDetail = 1.0 - smoothstep(900.0, 2400.0, camDist);
+
+    // Vertex-cull invisible/distant mist billboards to avoid wasted fragment overdraw
+    if (vAlpha < 0.004) {
+      vWorldPos = vec3(0.0);
+      gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+      return;
+    }
 
     // Horizontally wide drifting mist billboard oriented toward camera
     vec3 camRight = vec3(viewMatrix[0][0], viewMatrix[1][0], viewMatrix[2][0]);
@@ -319,6 +396,7 @@ const MIST_FRAG = /* glsl */ `
   varying vec2 vUv;
   varying float vSeed;
   varying float vAlpha;
+  varying float vMistDetail;
   varying vec3 vWorldPos;
 
   vec3 safeNormalize(vec3 v) {
@@ -350,11 +428,14 @@ const MIST_FRAG = /* glsl */ `
     float r2 = dot(c, c);
     if (r2 > 1.0) discard;
 
-    // Slowly drifting wispy coastal sea-mist curl pattern
+    // Slowly drifting wispy coastal sea-mist curl pattern (2nd octave distance-culled)
     vec2 driftUv = vUv * vec2(3.4, 2.2) + vec2(uTime * 0.055 + vSeed, -uTime * 0.02 + vSeed * 0.7);
     float n1 = noise2(driftUv);
-    float n2 = noise2(driftUv * 2.3 - vec2(uTime * 0.04, uTime * 0.03));
-    float cloud = n1 * 0.62 + n2 * 0.38;
+    float cloud = n1;
+    if (vMistDetail > 0.002) {
+      float n2 = noise2(driftUv * 2.3 - vec2(uTime * 0.04, uTime * 0.03));
+      cloud = mix(n1, n1 * 0.62 + n2 * 0.38, vMistDetail);
+    }
 
     float radial = pow(max(1.0 - r2, 1e-4), 1.9);
     float baseSoft = smoothstep(0.0, 0.35, vUv.y) * (1.0 - smoothstep(0.65, 1.0, vUv.y));
@@ -383,7 +464,7 @@ interface StackPlacement {
   sy: number;
   sz: number;
   rotY: number;
-  archetype: number;
+  seed: number;
 }
 
 /**
@@ -395,12 +476,17 @@ function pushOutwardTriangle(
   positions: number[],
   normals: number[],
   aos: number[],
+  colMods: number[],
   pA: [number, number, number],
   pB: [number, number, number],
   pC: [number, number, number],
   aoA: number,
   aoB: number,
   aoC: number,
+  colHash: number,
+  modA: number,
+  modB: number,
+  modC: number,
   expectedOutward: [number, number, number],
 ): void {
   const e1x = pB[0] - pA[0];
@@ -419,11 +505,15 @@ function pushOutwardTriangle(
   let c = pC;
   let bAo = aoB;
   let cAo = aoC;
+  let bMod = modB;
+  let cMod = modC;
   if (dot < 0) {
     b = pC;
     c = pB;
     bAo = aoC;
     cAo = aoB;
+    bMod = modC;
+    cMod = modB;
     nx = -nx;
     ny = -ny;
     nz = -nz;
@@ -439,12 +529,14 @@ function pushOutwardTriangle(
   positions.push(pA[0], pA[1], pA[2], b[0], b[1], b[2], c[0], c[1], c[2]);
   normals.push(nx, ny, nz, nx, ny, nz, nx, ny, nz);
   aos.push(aoA, bAo, cAo);
+  colMods.push(colHash, modA, colHash, bMod, colHash, cMod);
 }
 
 /**
  * Generates a clustered hexagonal columnar basalt cliff spire geometry.
  * Columns are packed on a true axial hexagonal grid with stepped fracture tiers,
- * bevelled fractured polygonal crowns, outward-verified normals, and crevice AO.
+ * bevelled fractured polygonal crowns, outward-verified normals, crevice AO, and
+ * per-column rigid height-modulation attributes for single-draw instanced variety.
  */
 function buildBasaltClusterGeometry(seed: number): THREE.BufferGeometry {
   let rngState = seed;
@@ -456,6 +548,7 @@ function buildBasaltClusterGeometry(seed: number): THREE.BufferGeometry {
   const positions: number[] = [];
   const normals: number[] = [];
   const aos: number[] = [];
+  const colMods: number[] = [];
 
   const hexCellRadius = 8.4;
   const sqrt3 = Math.sqrt(3);
@@ -508,6 +601,11 @@ function buildBasaltClusterGeometry(seed: number): THREE.BufferGeometry {
       const tierY = [baseY, midY, bevelY, topY];
       const tierR = [colRadius * 1.07, colRadius * 1.0, colRadius * 0.96, colRadius * 0.78];
 
+      // Rigid upper-column height modulation span (anchored at baseY, rigid lift on upper tiers)
+      const colHash = rand();
+      const maxDeltaY = Math.min(28.0, (midY - baseY) * 0.34);
+      const tierMod = [0.0, maxDeltaY, maxDeltaY, maxDeltaY];
+
       // Ambient occlusion: inner hex crevices darker, outer ridges and high crowns brighter
       const radialAO = THREE.MathUtils.clamp(0.45 + (hexDist / maxRing) * 0.42, 0.45, 0.95);
       const tierAO = [radialAO * 0.62, radialAO * 0.84, radialAO * 0.96, 1.0];
@@ -540,6 +638,8 @@ function buildBasaltClusterGeometry(seed: number): THREE.BufferGeometry {
         const upper = rings[t + 1];
         const aoLo = tierAO[t];
         const aoHi = tierAO[t + 1];
+        const modLo = tierMod[t];
+        const modHi = tierMod[t + 1];
         const isBevel = t === 2;
 
         for (let k = 0; k < 6; k++) {
@@ -554,8 +654,8 @@ function buildBasaltClusterGeometry(seed: number): THREE.BufferGeometry {
           const t0 = upper[k];
           const t1 = upper[kNext];
 
-          pushOutwardTriangle(positions, normals, aos, b0, t0, b1, aoLo, aoHi, aoLo, outDir);
-          pushOutwardTriangle(positions, normals, aos, b1, t0, t1, aoLo, aoHi, aoHi, outDir);
+          pushOutwardTriangle(positions, normals, aos, colMods, b0, t0, b1, aoLo, aoHi, aoLo, colHash, modLo, modHi, modLo, outDir);
+          pushOutwardTriangle(positions, normals, aos, colMods, b1, t0, t1, aoLo, aoHi, aoHi, colHash, modLo, modHi, modHi, outDir);
         }
       }
 
@@ -574,12 +674,17 @@ function buildBasaltClusterGeometry(seed: number): THREE.BufferGeometry {
           positions,
           normals,
           aos,
+          colMods,
           crownCentre,
           crownRing[kNext],
           crownRing[k],
           1.0,
           0.98,
           0.98,
+          colHash,
+          maxDeltaY,
+          maxDeltaY,
+          maxDeltaY,
           upDir,
         );
       }
@@ -590,6 +695,7 @@ function buildBasaltClusterGeometry(seed: number): THREE.BufferGeometry {
   geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
   geo.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
   geo.setAttribute('aColumnAO', new THREE.Float32BufferAttribute(aos, 1));
+  geo.setAttribute('aColumnMod', new THREE.Float32BufferAttribute(colMods, 2));
   geo.computeBoundingSphere();
   return geo;
 }
@@ -686,7 +792,7 @@ export class SeaStacks {
       sy,
       sz: sx * (0.86 + (idx % 3) * 0.13),
       rotY: idx * 1.173,
-      archetype: idx % 2,
+      seed: idx * 1.6180339,
     }));
 
     this.rockMat = new THREE.ShaderMaterial({
@@ -702,28 +808,25 @@ export class SeaStacks {
       },
     });
 
-    // Two distinct clustered hexagonal basalt spire archetypes rendered in 2 instanced draw calls
-    const archetypes = [
-      buildBasaltClusterGeometry(1337),
-      buildBasaltClusterGeometry(7919),
-    ];
+    // Consolidate all 20 hexagonal basalt sea-stacks into 1 single instanced draw call
+    // with per-instance deterministic column-height seeds for distinct organic silhouettes.
+    const rockGeo = buildBasaltClusterGeometry(1337);
+    const stackSeeds = new Float32Array(placements.length);
+    const rockInst = new THREE.InstancedMesh(rockGeo, this.rockMat, placements.length);
+    rockInst.frustumCulled = false;
 
     const dummy = new THREE.Object3D();
-    for (let a = 0; a < archetypes.length; a++) {
-      const subset = placements.filter((p) => p.archetype === a);
-      const inst = new THREE.InstancedMesh(archetypes[a], this.rockMat, subset.length);
-      inst.frustumCulled = false;
-
-      subset.forEach((p, idx) => {
-        dummy.position.set(p.x, 0, p.z);
-        dummy.scale.set(p.sx, p.sy, p.sz);
-        dummy.rotation.set(0, p.rotY, (idx % 2 === 0 ? 1 : -1) * 0.025);
-        dummy.updateMatrix();
-        inst.setMatrixAt(idx, dummy.matrix);
-      });
-      inst.instanceMatrix.needsUpdate = true;
-      this.group.add(inst);
-    }
+    placements.forEach((p, idx) => {
+      dummy.position.set(p.x, 0, p.z);
+      dummy.scale.set(p.sx, p.sy, p.sz);
+      dummy.rotation.set(0, p.rotY, (idx % 2 === 0 ? 1 : -1) * 0.025);
+      dummy.updateMatrix();
+      rockInst.setMatrixAt(idx, dummy.matrix);
+      stackSeeds[idx] = p.seed;
+    });
+    rockGeo.setAttribute('aStackSeed', new THREE.InstancedBufferAttribute(stackSeeds, 1));
+    rockInst.instanceMatrix.needsUpdate = true;
+    this.group.add(rockInst);
 
     // Drifting coastal sea-mist collars hugging the basalt splash zone
     this.mistMat = new THREE.ShaderMaterial({
