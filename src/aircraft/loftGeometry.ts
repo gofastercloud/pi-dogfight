@@ -1,7 +1,9 @@
 import * as THREE from 'three';
+import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 
 /**
- * Reusable aerospace geometry lofting and bevelled supersonic airfoil builders.
+ * Reusable aerospace geometry lofting, bevelled supersonic airfoil builders,
+ * and static sub-mesh buffer consolidation helpers.
  * Every builder guarantees outward-facing triangle winding, continuous UVs,
  * and smooth vertex normals across UV seams.
  */
@@ -984,4 +986,163 @@ export function buildNozzlePetalGeometry(spec: NozzlePetalSpec): THREE.BufferGeo
     capBack: true,
     smoothSeamNormals: false,
   });
+}
+
+// ---------------------------------------------------------------------------
+// 6. STATIC SUB-MESH BUFFER CONSOLIDATION (DRAW-CALL MERGING)
+// ---------------------------------------------------------------------------
+
+export interface MergeGeometryEntry {
+  geometry: THREE.BufferGeometry;
+  position?: readonly [number, number, number];
+  rotation?: readonly [number, number, number];
+  rotationOrder?: THREE.EulerOrder;
+  scale?: readonly [number, number, number];
+  matrix?: THREE.Matrix4;
+  /** Dispose the input geometry after cloning into the merged buffer. Default: false. */
+  disposeSource?: boolean;
+}
+
+const _mergePos = new THREE.Vector3();
+const _mergeScale = new THREE.Vector3();
+const _mergeQuat = new THREE.Quaternion();
+const _mergeEuler = new THREE.Euler();
+const _mergeMat = new THREE.Matrix4();
+
+/**
+ * Bakes transforms into static sub-mesh geometries, normalises attribute sets
+ * (position, normal, uv) and index representation, preserves outward triangle
+ * winding, and merges them into a single GPU BufferGeometry.
+ */
+export function mergeSubGeometries(entries: readonly MergeGeometryEntry[]): THREE.BufferGeometry {
+  if (entries.length === 0) {
+    throw new Error('mergeSubGeometries requires at least 1 entry');
+  }
+
+  let anyIndexed = false;
+  for (let i = 0; i < entries.length; i++) {
+    if (entries[i].geometry.index !== null) {
+      anyIndexed = true;
+      break;
+    }
+  }
+
+  const prepared: THREE.BufferGeometry[] = [];
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i];
+    const clone = entry.geometry.clone();
+
+    if (!clone.hasAttribute('normal')) {
+      clone.computeVertexNormals();
+    }
+
+    const posAttr = clone.getAttribute('position');
+    if (!clone.hasAttribute('uv')) {
+      clone.setAttribute('uv', new THREE.Float32BufferAttribute(new Float32Array(posAttr.count * 2), 2));
+    }
+
+    // Keep identical attribute layout across all merged parts
+    for (const attrName of Object.keys(clone.attributes)) {
+      if (attrName !== 'position' && attrName !== 'normal' && attrName !== 'uv') {
+        clone.deleteAttribute(attrName);
+      }
+    }
+
+    let mat: THREE.Matrix4 | null = null;
+    if (entry.matrix) {
+      mat = entry.matrix;
+    } else if (entry.position || entry.rotation || entry.scale) {
+      if (entry.position) {
+        _mergePos.set(entry.position[0], entry.position[1], entry.position[2]);
+      } else {
+        _mergePos.set(0, 0, 0);
+      }
+
+      if (entry.rotation) {
+        _mergeEuler.set(
+          entry.rotation[0],
+          entry.rotation[1],
+          entry.rotation[2],
+          entry.rotationOrder ?? 'XYZ',
+        );
+        _mergeQuat.setFromEuler(_mergeEuler);
+      } else {
+        _mergeQuat.identity();
+      }
+
+      if (entry.scale) {
+        _mergeScale.set(entry.scale[0], entry.scale[1], entry.scale[2]);
+      } else {
+        _mergeScale.set(1, 1, 1);
+      }
+
+      _mergeMat.compose(_mergePos, _mergeQuat, _mergeScale);
+      mat = _mergeMat;
+    }
+
+    if (mat) {
+      clone.applyMatrix4(mat);
+
+      // Restore outward CCW triangle winding if transform included an odd reflection
+      if (mat.determinant() < 0) {
+        if (clone.index) {
+          const idxArr = clone.index.array;
+          for (let k = 0; k < idxArr.length; k += 3) {
+            const tmp = idxArr[k + 1];
+            idxArr[k + 1] = idxArr[k + 2];
+            idxArr[k + 2] = tmp;
+          }
+          clone.index.needsUpdate = true;
+        } else {
+          const count = posAttr.count;
+          const idx = new Uint32Array(count);
+          for (let k = 0; k < count; k += 3) {
+            idx[k] = k;
+            idx[k + 1] = k + 2;
+            idx[k + 2] = k + 1;
+          }
+          clone.setIndex(new THREE.BufferAttribute(idx, 1));
+          anyIndexed = true;
+        }
+      }
+    }
+
+    if (anyIndexed && !clone.index) {
+      const count = posAttr.count;
+      const idx = count > 65535 ? new Uint32Array(count) : new Uint16Array(count);
+      for (let k = 0; k < count; k++) idx[k] = k;
+      clone.setIndex(new THREE.BufferAttribute(idx, 1));
+    }
+
+    prepared.push(clone);
+    if (entry.disposeSource) {
+      entry.geometry.dispose();
+    }
+  }
+
+  // Ensure every entry has an index buffer if a reflection added one late
+  if (anyIndexed) {
+    for (let i = 0; i < prepared.length; i++) {
+      const g = prepared[i];
+      if (!g.index) {
+        const count = g.getAttribute('position').count;
+        const idx = count > 65535 ? new Uint32Array(count) : new Uint16Array(count);
+        for (let k = 0; k < count; k++) idx[k] = k;
+        g.setIndex(new THREE.BufferAttribute(idx, 1));
+      }
+    }
+  }
+
+  const merged = mergeGeometries(prepared, false);
+  for (let i = 0; i < prepared.length; i++) {
+    prepared[i].dispose();
+  }
+
+  if (!merged) {
+    throw new Error('mergeSubGeometries failed to merge prepared geometries');
+  }
+
+  merged.computeBoundingBox();
+  merged.computeBoundingSphere();
+  return merged;
 }
