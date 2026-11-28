@@ -235,6 +235,7 @@ const HEAT_SHIMMER_VERT = /* glsl */ `
   varying vec2 vUv;
   varying vec3 vNormal;
   varying vec3 vViewPos;
+  varying float vTurb;
   uniform float uTime;
   uniform float uThrottle;
 
@@ -247,9 +248,26 @@ const HEAT_SHIMMER_VERT = /* glsl */ `
     vUv = uv;
     vec3 p = position;
     float along = 1.0 - uv.y;
-    float shimmer = sin(along * 22.0 - uTime * 68.0) * 0.075 * along * uThrottle;
-    p.x *= 1.0 + shimmer;
-    p.y *= 1.0 - shimmer;
+    float theta = uv.x * 6.2831853;
+    float throttleDrive = clamp(uThrottle, 0.0, 1.8);
+
+    // Multi-harmonic supersonic shock-diamond breathing & shear-layer turbulence
+    float waveA = sin(along * 24.0 - uTime * 72.0 + theta * 2.0);
+    float waveB = cos(along * 41.0 - uTime * 108.0 - theta * 3.0);
+    float waveC = sin(along * 15.0 - uTime * 46.0 + theta * 5.0);
+    float turb = waveA * 0.52 + waveB * 0.30 + waveC * 0.18;
+    vTurb = turb;
+
+    // Radial acoustic shimmer expanding smoothly down the exhaust cone
+    float radialDisp = turb * 0.115 * along * throttleDrive;
+    p.x *= 1.0 + radialDisp;
+    p.y *= 1.0 + radialDisp * 0.85 - waveA * 0.045 * along * throttleDrive;
+
+    // Convective downstream heat-haze wake flutter growing quadratically aft of the nozzle
+    float swayAmt = along * along * 0.24 * throttleDrive;
+    p.x += sin(along * 13.0 - uTime * 54.0) * swayAmt;
+    p.y += cos(along * 16.0 - uTime * 61.0) * swayAmt;
+
     vec4 mvPos = modelViewMatrix * vec4(p, 1.0);
     vViewPos = -mvPos.xyz;
     vNormal = safeNormalize(normalMatrix * normal);
@@ -261,6 +279,7 @@ const HEAT_SHIMMER_FRAG = /* glsl */ `
   varying vec2 vUv;
   varying vec3 vNormal;
   varying vec3 vViewPos;
+  varying float vTurb;
   uniform float uTime;
   uniform float uThrottle;
   uniform float uTrip;
@@ -275,8 +294,8 @@ const HEAT_SHIMMER_FRAG = /* glsl */ `
     float along = 1.0 - vUv.y;
     float ndotv = clamp(abs(dot(safeNormalize(vNormal), safeNormalize(vViewPos))), 0.0, 1.0);
     float rim = pow(max(1.0 - ndotv, 1e-4), 1.45);
-    float diamonds = pow(max(sin(along * 30.0 + uTime * 42.0) * 0.5 + 0.5, 1e-4), 3.0);
-    float haze = 0.65 + 0.35 * sin(vUv.x * 24.0 + uTime * 35.0) * cos(along * 18.0 - uTime * 48.0);
+    float diamonds = pow(max(sin(along * 30.0 + uTime * 42.0 + vTurb * 1.15) * 0.5 + 0.5, 1e-4), 3.0);
+    float haze = clamp(0.68 + 0.32 * vTurb, 0.25, 1.25);
 
     float fadeEnds = smoothstep(0.0, 0.32, along) * (1.0 - smoothstep(0.85, 1.0, along));
     vec3 col = mix(vec3(0.55, 0.78, 1.15), uAccentColor * 1.8, diamonds * 0.72 + uTrip * 0.25);
@@ -287,14 +306,77 @@ const HEAT_SHIMMER_FRAG = /* glsl */ `
   }
 `;
 
+const GLOW_BILLBOARD_VERT = /* glsl */ `
+  attribute vec4 aPosScale;
+  attribute vec4 aColorAlpha;
+
+  varying vec2 vUv;
+  varying vec4 vColorAlpha;
+
+  void main() {
+    if (aPosScale.w <= 1e-4 || aColorAlpha.a <= 1e-4) {
+      gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+      vUv = vec2(0.0);
+      vColorAlpha = vec4(0.0);
+      return;
+    }
+
+    vec3 camRight = vec3(viewMatrix[0][0], viewMatrix[1][0], viewMatrix[2][0]);
+    vec3 camUp = vec3(viewMatrix[0][1], viewMatrix[1][1], viewMatrix[2][1]);
+    vec3 worldPos = aPosScale.xyz + (camRight * position.x + camUp * position.y) * aPosScale.w;
+
+    vUv = uv;
+    vColorAlpha = aColorAlpha;
+    gl_Position = projectionMatrix * viewMatrix * vec4(worldPos, 1.0);
+  }
+`;
+
+const GLOW_BILLBOARD_FRAG = /* glsl */ `
+  uniform sampler2D uMap;
+
+  varying vec2 vUv;
+  varying vec4 vColorAlpha;
+
+  void main() {
+    vec4 tex = texture2D(uMap, vUv);
+    float alpha = clamp(tex.a * vColorAlpha.a, 0.0, 1.0);
+    if (alpha < 0.005) discard;
+    gl_FragColor = vec4(clamp(tex.rgb * vColorAlpha.rgb, 0.0, 14.0), alpha);
+  }
+`;
+
+function createInstancedGlowBillboardGeometry(
+  posScaleAttr: THREE.InstancedBufferAttribute,
+  colorAlphaAttr: THREE.InstancedBufferAttribute,
+): THREE.InstancedBufferGeometry {
+  const geo = new THREE.InstancedBufferGeometry();
+  const positions = new Float32Array([
+    -0.5, -0.5, 0,
+     0.5, -0.5, 0,
+     0.5,  0.5, 0,
+    -0.5,  0.5, 0,
+  ]);
+  const uvs = new Float32Array([
+    0, 0,
+    1, 0,
+    1, 1,
+    0, 1,
+  ]);
+  geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geo.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+  geo.setAttribute('aPosScale', posScaleAttr);
+  geo.setAttribute('aColorAlpha', colorAlphaAttr);
+  geo.setIndex([0, 1, 2, 0, 2, 3]);
+  geo.instanceCount = 0;
+  return geo;
+}
+
 interface ExplosionSlot {
   active: boolean;
   group: THREE.Group;
   origin: THREE.Vector3;
   fireball: THREE.Mesh;
   fireballMat: THREE.ShaderMaterial;
-  coreSprite: THREE.Sprite;
-  coreMat: THREE.SpriteMaterial;
   shockRing: THREE.Mesh;
   shockRingMat: THREE.MeshBasicMaterial;
   shockRing2: THREE.Mesh;
@@ -352,11 +434,10 @@ interface FlareSlot {
   active: boolean;
   pos: THREE.Vector3;
   vel: THREE.Vector3;
-  sprite: THREE.Sprite;
-  mat: THREE.SpriteMaterial;
   ribbon: VolumetricRibbon | null;
   age: number;
   life: number;
+  baseScale: number;
   sparkTimer: number;
 }
 
@@ -391,10 +472,20 @@ export class BayhemVFX {
   public readonly trails: MissileTrailSystem;
 
   private readonly glowTex: THREE.CanvasTexture;
+  private readonly glowBillboardMat: THREE.ShaderMaterial;
   private readonly sunDir = DEFAULT_SUN_DIR.clone();
 
   private readonly explosionPool: ExplosionSlot[] = [];
   private explosionCursor = 0;
+
+  // Consolidated instanced explosion core flash billboards (replaces per-explosion THREE.Sprite draws)
+  private readonly explosionCorePosScaleData = new Float32Array(MAX_EXPLOSIONS * 4);
+  private readonly explosionCoreColorAlphaData = new Float32Array(MAX_EXPLOSIONS * 4);
+  private readonly explosionCorePosScaleAttr: THREE.InstancedBufferAttribute;
+  private readonly explosionCoreColorAlphaAttr: THREE.InstancedBufferAttribute;
+  private readonly explosionCoreGeo: THREE.InstancedBufferGeometry;
+  private readonly explosionCoreMesh: THREE.Mesh;
+  private explosionCoresDirty = false;
 
   private readonly missilePool: MissileSlot[] = [];
   private missileCursor = 0;
@@ -407,12 +498,20 @@ export class BayhemVFX {
   private readonly tracerLife = new Float32Array(MAX_TRACERS);
   private readonly tracerVariant = new Uint8Array(MAX_TRACERS);
   private tracerCursor = 0;
+  private tracersDirty = false;
   private readonly muzzleRings: MuzzleRingSlot[] = [];
   private muzzleRingCursor = 0;
 
-  // Pooled decoy flares
+  // Pooled decoy flares + consolidated instanced flare billboard mesh
   private readonly flarePool: FlareSlot[] = [];
   private flareCursor = 0;
+  private readonly flarePosScaleData = new Float32Array(MAX_FLARES * 4);
+  private readonly flareColorAlphaData = new Float32Array(MAX_FLARES * 4);
+  private readonly flarePosScaleAttr: THREE.InstancedBufferAttribute;
+  private readonly flareColorAlphaAttr: THREE.InstancedBufferAttribute;
+  private readonly flareGeo: THREE.InstancedBufferGeometry;
+  private readonly flareMesh: THREE.Mesh;
+  private flaresDirty = false;
 
   // Registered aircraft wingtip contrails, Prandtl-Glauert cones & Mach heat shimmer
   private readonly contrails: ContrailRig[] = [];
@@ -449,13 +548,27 @@ export class BayhemVFX {
   private readonly _tmpColor = new THREE.Color();
   private readonly _tracerGold = new THREE.Color(2.6, 2.0, 0.72);
   private readonly _tracerAmber = new THREE.Color(2.5, 0.95, 0.28);
+  private readonly _coreStandardColor = new THREE.Color(0xffe8bb);
+  private readonly _coreSupernovaColor = new THREE.Color(0xffbbff);
+  private readonly _flareColor = new THREE.Color(0xfff2be);
 
   constructor(scene: THREE.Scene) {
     this.group.name = 'BayhemVFX';
     scene.add(this.group);
     this.glowTex = createGlowTexture();
 
-    // True GPU-instanced ring-buffered particle engine (6,400 puffs + 4,200 sparks + 360 debris)
+    this.glowBillboardMat = new THREE.ShaderMaterial({
+      vertexShader: GLOW_BILLBOARD_VERT,
+      fragmentShader: GLOW_BILLBOARD_FRAG,
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      uniforms: {
+        uMap: { value: this.glowTex },
+      },
+    });
+
+    // True GPU-kinematic instanced particle engine (6,400 puffs + 4,200 sparks + 360 debris)
     this.particles = new GpuParticleSystem(this.group);
     // Volumetric camera-facing twist-free ribbon trail system
     this.trails = new MissileTrailSystem(this.group);
@@ -465,9 +578,30 @@ export class BayhemVFX {
     this.outerConeGeo.rotateX(-Math.PI / 2);
     this.innerConeGeo = new THREE.ConeGeometry(4.4, 5.0, 32, 3, true);
     this.innerConeGeo.rotateX(-Math.PI / 2);
-    this.shimmerGeo = new THREE.ConeGeometry(0.95, 10.5, 18, 6, true);
+    this.shimmerGeo = new THREE.ConeGeometry(0.95, 10.5, 18, 10, true);
     this.shimmerGeo.translate(0, 5.25, 0);
     this.shimmerGeo.rotateX(Math.PI / 2);
+
+    // Pre-allocated instanced mesh for explosion core flash sprites (1 draw call max)
+    this.explosionCorePosScaleAttr = new THREE.InstancedBufferAttribute(
+      this.explosionCorePosScaleData,
+      4,
+    );
+    this.explosionCorePosScaleAttr.setUsage(THREE.DynamicDrawUsage);
+    this.explosionCoreColorAlphaAttr = new THREE.InstancedBufferAttribute(
+      this.explosionCoreColorAlphaData,
+      4,
+    );
+    this.explosionCoreColorAlphaAttr.setUsage(THREE.DynamicDrawUsage);
+    this.explosionCoreGeo = createInstancedGlowBillboardGeometry(
+      this.explosionCorePosScaleAttr,
+      this.explosionCoreColorAlphaAttr,
+    );
+    this.explosionCoreMesh = new THREE.Mesh(this.explosionCoreGeo, this.glowBillboardMat);
+    this.explosionCoreMesh.frustumCulled = false;
+    this.explosionCoreMesh.visible = false;
+    this.explosionCoreMesh.renderOrder = 25;
+    this.group.add(this.explosionCoreMesh);
 
     // Pre-allocate multi-stage explosion pool (zero GPU allocations during combat)
     for (let i = 0; i < MAX_EXPLOSIONS; i++) {
@@ -489,17 +623,6 @@ export class BayhemVFX {
       });
       const fireball = new THREE.Mesh(this.fireballGeo, fbMat);
       g.add(fireball);
-
-      const coreMat = new THREE.SpriteMaterial({
-        map: this.glowTex,
-        color: 0xffe8bb,
-        transparent: true,
-        opacity: 0,
-        blending: THREE.AdditiveBlending,
-        depthWrite: false,
-      });
-      const coreSprite = new THREE.Sprite(coreMat);
-      g.add(coreSprite);
 
       const shockRingMat = new THREE.MeshBasicMaterial({
         color: 0xffc070,
@@ -549,8 +672,6 @@ export class BayhemVFX {
         origin: new THREE.Vector3(),
         fireball,
         fireballMat: fbMat,
-        coreSprite,
-        coreMat,
         shockRing,
         shockRingMat,
         shockRing2,
@@ -652,6 +773,7 @@ export class BayhemVFX {
     this.tracerInst.instanceColor!.setUsage(THREE.DynamicDrawUsage);
     this.tracerInst.frustumCulled = false;
     this.tracerInst.count = 0;
+    this.tracerInst.visible = false;
     this.group.add(this.tracerInst);
 
     // Pre-allocate expanding Vulcan muzzle flash rings
@@ -670,28 +792,31 @@ export class BayhemVFX {
       this.muzzleRings.push({ active: false, mesh, mat, age: 0, life: 0.09 });
     }
 
-    // Pre-allocate decoy flare pool
+    // Pre-allocated instanced mesh for decoy flare sprites (1 draw call max)
+    this.flarePosScaleAttr = new THREE.InstancedBufferAttribute(this.flarePosScaleData, 4);
+    this.flarePosScaleAttr.setUsage(THREE.DynamicDrawUsage);
+    this.flareColorAlphaAttr = new THREE.InstancedBufferAttribute(this.flareColorAlphaData, 4);
+    this.flareColorAlphaAttr.setUsage(THREE.DynamicDrawUsage);
+    this.flareGeo = createInstancedGlowBillboardGeometry(
+      this.flarePosScaleAttr,
+      this.flareColorAlphaAttr,
+    );
+    this.flareMesh = new THREE.Mesh(this.flareGeo, this.glowBillboardMat);
+    this.flareMesh.frustumCulled = false;
+    this.flareMesh.visible = false;
+    this.flareMesh.renderOrder = 23;
+    this.group.add(this.flareMesh);
+
+    // Pre-allocate decoy flare pool (zero per-flare THREE.Sprite objects or materials)
     for (let i = 0; i < MAX_FLARES; i++) {
-      const mat = new THREE.SpriteMaterial({
-        map: this.glowTex,
-        color: 0xfff2be,
-        transparent: true,
-        opacity: 0,
-        blending: THREE.AdditiveBlending,
-        depthWrite: false,
-      });
-      const sprite = new THREE.Sprite(mat);
-      sprite.visible = false;
-      this.group.add(sprite);
       this.flarePool.push({
         active: false,
         pos: new THREE.Vector3(),
         vel: new THREE.Vector3(),
-        sprite,
-        mat,
         ribbon: null,
         age: 0,
         life: 2.2,
+        baseScale: 12.0,
         sparkTimer: 0,
       });
     }
@@ -829,6 +954,9 @@ export class BayhemVFX {
       e.group.visible = false;
       e.light.intensity = 0;
     }
+    this.explosionCoreGeo.instanceCount = 0;
+    this.explosionCoreMesh.visible = false;
+    this.explosionCoresDirty = false;
 
     for (let i = 0; i < this.missilePool.length; i++) {
       const slot = this.missilePool[i];
@@ -842,6 +970,8 @@ export class BayhemVFX {
 
     this.tracerLife.fill(0);
     this.tracerInst.count = 0;
+    this.tracerInst.visible = false;
+    this.tracersDirty = false;
 
     for (let i = 0; i < this.muzzleRings.length; i++) {
       this.muzzleRings[i].active = false;
@@ -851,9 +981,11 @@ export class BayhemVFX {
     for (let i = 0; i < this.flarePool.length; i++) {
       const f = this.flarePool[i];
       f.active = false;
-      f.sprite.visible = false;
       f.ribbon = null;
     }
+    this.flareGeo.instanceCount = 0;
+    this.flareMesh.visible = false;
+    this.flaresDirty = false;
 
     this.particles.clear();
     this.trails.clearDynamic();
@@ -899,10 +1031,7 @@ export class BayhemVFX {
     slot.fireballMat.uniforms.uProgress.value = 0;
     slot.fireballMat.uniforms.uTrip.value = tripIntensity;
     slot.fireballMat.uniforms.uSupernova.value = supernova ? 1.0 : 0.0;
-
-    slot.coreMat.color.setHex(supernova ? 0xffbbff : 0xffe8bb);
-    slot.coreMat.opacity = 1.0;
-    slot.coreSprite.scale.setScalar(scale * (supernova ? 5.8 : 3.5));
+    this.explosionCoresDirty = true;
 
     slot.shockRingMat.color.setHex(supernova ? 0x82f6ff : 0xffbe68);
     slot.shockRingMat.opacity = 0.96;
@@ -1242,6 +1371,7 @@ export class BayhemVFX {
       this.tracerLife[idx] = 0.85;
       this.tracerVariant[idx] = i % 2;
     }
+    this.tracersDirty = true;
 
     // 3. Incandescent muzzle flash sparks + hot gunsmoke puff
     for (let i = 0; i < 12; i++) {
@@ -1415,15 +1545,13 @@ export class BayhemVFX {
       slot.active = true;
       slot.pos.set(bx, by, bz);
       slot.vel.set(jvx + this._eject.x, jvy + this._eject.y, jvz + this._eject.z);
-      slot.sprite.position.set(bx, by, bz);
-      slot.sprite.scale.setScalar(11.5 + Math.random() * 5.5);
-      slot.sprite.visible = true;
-      slot.mat.opacity = 1.0;
       slot.ribbon = ribbon;
       slot.age = 0;
       slot.life = 2.0 + Math.random() * 1.1;
+      slot.baseScale = 11.5 + Math.random() * 5.5;
       slot.sparkTimer = 0;
     }
+    this.flaresDirty = true;
   }
 
   public update(
@@ -1447,6 +1575,7 @@ export class BayhemVFX {
     let flashR = 3.6;
     let flashG = 2.2;
     let flashB = 1.0;
+    let liveCores = 0;
 
     for (let i = 0; i < this.explosionPool.length; i++) {
       const e = this.explosionPool[i];
@@ -1509,8 +1638,20 @@ export class BayhemVFX {
       e.fireballMat.uniforms.uTrip.value = tripIntensity;
 
       const flashFade = Math.max(0, 1 - p * 3.8);
-      e.coreMat.opacity = flashFade;
-      e.coreSprite.scale.setScalar(e.maxScale * (e.supernova ? 3.9 : 2.6) * (0.58 + p * 1.25));
+      if (flashFade > 0.005) {
+        const coreScale = e.maxScale * (e.supernova ? 3.9 : 2.6) * (0.58 + p * 1.25);
+        const cCol = e.supernova ? this._coreSupernovaColor : this._coreStandardColor;
+        const c4 = liveCores * 4;
+        this.explosionCorePosScaleData[c4] = e.origin.x;
+        this.explosionCorePosScaleData[c4 + 1] = e.origin.y;
+        this.explosionCorePosScaleData[c4 + 2] = e.origin.z;
+        this.explosionCorePosScaleData[c4 + 3] = coreScale;
+        this.explosionCoreColorAlphaData[c4] = cCol.r;
+        this.explosionCoreColorAlphaData[c4 + 1] = cCol.g;
+        this.explosionCoreColorAlphaData[c4 + 2] = cCol.b;
+        this.explosionCoreColorAlphaData[c4 + 3] = flashFade;
+        liveCores++;
+      }
 
       e.shockRing.scale.setScalar(e.maxScale * (0.35 + p * (e.supernova ? 12.2 : 5.0)));
       e.shockRingMat.opacity = Math.max(0, 1 - p * 1.32);
@@ -1543,6 +1684,19 @@ export class BayhemVFX {
         flashG = e.supernova ? 1.4 : 1.7;
         flashB = e.supernova ? 2.8 : 0.8;
       }
+    }
+
+    this.explosionCoreGeo.instanceCount = liveCores;
+    this.explosionCoreMesh.visible = liveCores > 0;
+    if (liveCores > 0 && (safeDt > 0 || this.explosionCoresDirty)) {
+      const coreFloats = liveCores * 4;
+      this.explosionCorePosScaleAttr.clearUpdateRanges();
+      this.explosionCorePosScaleAttr.addUpdateRange(0, coreFloats);
+      this.explosionCorePosScaleAttr.needsUpdate = true;
+      this.explosionCoreColorAlphaAttr.clearUpdateRanges();
+      this.explosionCoreColorAlphaAttr.addUpdateRange(0, coreFloats);
+      this.explosionCoreColorAlphaAttr.needsUpdate = true;
+      this.explosionCoresDirty = false;
     }
 
     this.particles.setCoreFlash(flashX, flashY, flashZ, flashR, flashG, flashB, bestFlashIntensity);
@@ -1609,8 +1763,10 @@ export class BayhemVFX {
       m.mesh.lookAt(this._missileLook);
 
       if (slot.ribbon) {
-        slot.ribbon.pushPoint(m.pos.x, m.pos.y, m.pos.z, 1.05);
-        slot.ribbon.rebuildGeometry(camPos);
+        if (safeDt > 0) {
+          slot.ribbon.pushPoint(m.pos.x, m.pos.y, m.pos.z, 1.05);
+        }
+        slot.ribbon.rebuildGeometry(camPos, safeDt);
       }
 
       // Emit rocket booster smoke puffs & incandescent tail sparks
@@ -1707,9 +1863,17 @@ export class BayhemVFX {
       liveTracers++;
     }
     this.tracerInst.count = liveTracers;
-    if (liveTracers > 0) {
+    this.tracerInst.visible = liveTracers > 0;
+    if (liveTracers > 0 && (safeDt > 0 || this.tracersDirty)) {
+      this.tracerInst.instanceMatrix.clearUpdateRanges();
+      this.tracerInst.instanceMatrix.addUpdateRange(0, liveTracers * 16);
       this.tracerInst.instanceMatrix.needsUpdate = true;
-      if (this.tracerInst.instanceColor) this.tracerInst.instanceColor.needsUpdate = true;
+      if (this.tracerInst.instanceColor) {
+        this.tracerInst.instanceColor.clearUpdateRanges();
+        this.tracerInst.instanceColor.addUpdateRange(0, liveTracers * 3);
+        this.tracerInst.instanceColor.needsUpdate = true;
+      }
+      this.tracersDirty = false;
     }
 
     for (let i = 0; i < this.muzzleRings.length; i++) {
@@ -1726,14 +1890,15 @@ export class BayhemVFX {
       r.mat.opacity = (1 - p) * 0.92;
     }
 
-    // 4. Update decoy countermeasure flares + volumetric flare ribbons
+    // 4. Update decoy countermeasure flares (consolidated instanced draw) + volumetric ribbons
+    let liveFlares = 0;
+    const flareCol = this._flareColor;
     for (let i = 0; i < this.flarePool.length; i++) {
       const f = this.flarePool[i];
       if (!f.active) continue;
       f.age += safeDt;
       if (f.age >= f.life) {
         f.active = false;
-        f.sprite.visible = false;
         if (f.ribbon) {
           f.ribbon.detach(0.8);
           f.ribbon = null;
@@ -1741,18 +1906,30 @@ export class BayhemVFX {
         continue;
       }
 
-      f.vel.y -= 28 * safeDt;
-      f.vel.multiplyScalar(Math.max(0, 1 - 0.65 * safeDt));
-      f.pos.addScaledVector(f.vel, safeDt);
-      f.sprite.position.copy(f.pos);
+      if (safeDt > 0) {
+        f.vel.y -= 28 * safeDt;
+        f.vel.multiplyScalar(Math.max(0, 1 - 0.65 * safeDt));
+        f.pos.addScaledVector(f.vel, safeDt);
+      }
 
       const fade = 1 - f.age / f.life;
-      f.mat.opacity = fade;
-      f.sprite.scale.setScalar((10.5 + Math.sin(time * 42 + i) * 2.5) * (0.42 + fade * 0.82));
+      const scale = (f.baseScale * 0.85 + Math.sin(time * 42 + i) * 2.5) * (0.42 + fade * 0.82);
+      const f4 = liveFlares * 4;
+      this.flarePosScaleData[f4] = f.pos.x;
+      this.flarePosScaleData[f4 + 1] = f.pos.y;
+      this.flarePosScaleData[f4 + 2] = f.pos.z;
+      this.flarePosScaleData[f4 + 3] = scale;
+      this.flareColorAlphaData[f4] = flareCol.r;
+      this.flareColorAlphaData[f4 + 1] = flareCol.g;
+      this.flareColorAlphaData[f4 + 2] = flareCol.b;
+      this.flareColorAlphaData[f4 + 3] = fade;
+      liveFlares++;
 
       if (f.ribbon) {
-        f.ribbon.pushPoint(f.pos.x, f.pos.y, f.pos.z, 0.55);
-        f.ribbon.rebuildGeometry(camPos);
+        if (safeDt > 0) {
+          f.ribbon.pushPoint(f.pos.x, f.pos.y, f.pos.z, 0.55);
+        }
+        f.ribbon.rebuildGeometry(camPos, safeDt);
       }
 
       if (safeDt > 0) {
@@ -1779,6 +1956,19 @@ export class BayhemVFX {
       }
     }
 
+    this.flareGeo.instanceCount = liveFlares;
+    this.flareMesh.visible = liveFlares > 0;
+    if (liveFlares > 0 && (safeDt > 0 || this.flaresDirty)) {
+      const flareFloats = liveFlares * 4;
+      this.flarePosScaleAttr.clearUpdateRanges();
+      this.flarePosScaleAttr.addUpdateRange(0, flareFloats);
+      this.flarePosScaleAttr.needsUpdate = true;
+      this.flareColorAlphaAttr.clearUpdateRanges();
+      this.flareColorAlphaAttr.addUpdateRange(0, flareFloats);
+      this.flareColorAlphaAttr.needsUpdate = true;
+      this.flaresDirty = false;
+    }
+
     // 5. Update wingtip contrail ribbons, multi-shell Prandtl-Glauert cones & Mach heat shimmer
     for (let i = 0; i < this.contrails.length; i++) {
       const c = this.contrails[i];
@@ -1791,9 +1981,11 @@ export class BayhemVFX {
         if (!c.rightRibbon.active || c.rightRibbon.detached) {
           c.rightRibbon.clearPoints();
         }
-        jet.getWorldWingtips(this._lTip, this._rTip);
-        c.leftRibbon.pushPoint(this._lTip.x, this._lTip.y, this._lTip.z, 1.15);
-        c.rightRibbon.pushPoint(this._rTip.x, this._rTip.y, this._rTip.z, 1.15);
+        if (safeDt > 0) {
+          jet.getWorldWingtips(this._lTip, this._rTip);
+          c.leftRibbon.pushPoint(this._lTip.x, this._lTip.y, this._lTip.z, 1.15);
+          c.rightRibbon.pushPoint(this._rTip.x, this._rTip.y, this._rTip.z, 1.15);
+        }
 
         // Sync multi-shell Prandtl-Glauert cones & Mach-diamond heat shimmer to jet pose
         c.aeroGroup.visible = true;
@@ -1876,8 +2068,8 @@ export class BayhemVFX {
 
         c.leftRibbon.setDynamicAppearance(baseHex, opacity, width, prismOn);
         c.rightRibbon.setDynamicAppearance(baseHex, opacity, width, prismOn);
-        c.leftRibbon.rebuildGeometry(camPos);
-        c.rightRibbon.rebuildGeometry(camPos);
+        c.leftRibbon.rebuildGeometry(camPos, safeDt);
+        c.rightRibbon.rebuildGeometry(camPos, safeDt);
       } else {
         c.aeroGroup.visible = false;
         if (c.leftRibbon.active && !c.leftRibbon.detached) {
@@ -1896,13 +2088,16 @@ export class BayhemVFX {
     this.trails.update(safeDt, time, camPos, tripIntensity);
 
     // 7. Speed lines aligned to camera
-    this.speedLines.position.copy(camPos);
-    this.speedLines.quaternion.copy(camera.quaternion);
     this.speedLinesMat.opacity = Math.max(0, (speedIntensity - 0.35) * 0.48 + tripIntensity * 0.18);
-    if (tripIntensity > 0.2) {
-      this.speedLinesMat.color.setHSL((time * 0.4) % 1.0, 0.95, 0.72);
-    } else {
-      this.speedLinesMat.color.setHex(0xd8f0ff);
+    this.speedLines.visible = this.speedLinesMat.opacity > 0.005;
+    if (this.speedLines.visible) {
+      this.speedLines.position.copy(camPos);
+      this.speedLines.quaternion.copy(camera.quaternion);
+      if (tripIntensity > 0.2) {
+        this.speedLinesMat.color.setHSL((time * 0.4) % 1.0, 0.95, 0.72);
+      } else {
+        this.speedLinesMat.color.setHex(0xd8f0ff);
+      }
     }
   }
 }
