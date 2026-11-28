@@ -1474,7 +1474,9 @@ export class FighterJet {
     this.darkMat = roleMats.darkMat;
     this.canopyMat = roleMats.canopyMat;
     this.glowMat = roleMats.glowMat;
-    this.hotLinerMat = roleMats.hotLinerMat;
+    // Per-aircraft hot liner clone avoids shared-material throttle contention across wingmen
+    // while sharing the exact same compiled MeshStandardMaterial WebGL program
+    this.hotLinerMat = roleMats.hotLinerMat.clone();
     this.wingSpan = isHero ? 6.32 : 6.12;
 
     const wingAero = createAeroWingHullMaterial(
@@ -2010,7 +2012,8 @@ export class FighterJet {
     }
 
     // 5. Thrust-vectoring nozzle gimbal & turkey-feather aperture dilation
-    const gimbalPitch = THREE.MathUtils.clamp(this.pitchRate * 0.18 + gNorm * 0.14, -0.26, 0.28);
+    // Nose-up pitch/G vectors the +Z exhaust upward (rotation.x < 0) to push the tail down
+    const gimbalPitch = THREE.MathUtils.clamp(-(this.pitchRate * 0.18 + gNorm * 0.14), -0.28, 0.26);
     const gimbalYaw = THREE.MathUtils.clamp(-this.yawRate * 0.20, -0.22, 0.22);
     const rollTvc = THREE.MathUtils.clamp(this.rollRate * 0.05, -0.08, 0.08);
     const petalScale = THREE.MathUtils.clamp(0.90 + this.throttle * 0.10, 0.88, 1.04);
