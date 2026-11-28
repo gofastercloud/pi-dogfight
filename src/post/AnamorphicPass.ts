@@ -164,6 +164,8 @@ export interface AnamorphicPassOptions {
   stretch?: number;
   coreWeight?: number;
   wideWeight?: number;
+  /** When false, skips the full-resolution composite pass so PostPipeline can fuse streaks in its uber pass. */
+  composite?: boolean;
 }
 
 /**
@@ -171,6 +173,7 @@ export interface AnamorphicPassOptions {
  * Extracts selective HDR highlights (sun, afterburners, decoy flares, fireballs)
  * with a soft-knee threshold so midtones stay clean, then performs progressive
  * multi-stride 1D horizontal blur passes to synthesise crisp cyan/amber cinema streaks.
+ * Exposes its low-resolution streak textures directly for single-pass fused compositing.
  */
 export class AnamorphicPass extends Pass {
   public intensity: number;
@@ -181,6 +184,7 @@ export class AnamorphicPass extends Pass {
   public wideWeight: number;
   public tripIntensity = 0;
   public shockIntensity = 0;
+  public readonly compositeToTarget: boolean;
 
   private readonly rtCore: THREE.WebGLRenderTarget;
   private readonly rtPing: THREE.WebGLRenderTarget;
@@ -188,7 +192,7 @@ export class AnamorphicPass extends Pass {
 
   private readonly extractMaterial: THREE.ShaderMaterial;
   private readonly blurMaterial: THREE.ShaderMaterial;
-  private readonly compositeMaterial: THREE.ShaderMaterial;
+  private readonly compositeMaterial: THREE.ShaderMaterial | null;
   private readonly fsQuad: FullScreenQuad;
 
   private readonly _clearColor = new THREE.Color(0, 0, 0);
@@ -203,8 +207,9 @@ export class AnamorphicPass extends Pass {
     this.stretch = options.stretch ?? 1.15;
     this.coreWeight = options.coreWeight ?? 0.68;
     this.wideWeight = options.wideWeight ?? 0.96;
+    this.compositeToTarget = options.composite ?? true;
 
-    this.needsSwap = true;
+    this.needsSwap = this.compositeToTarget;
 
     const safeW = Math.max(1, Math.round(width));
     const safeH = Math.max(1, Math.round(height));
@@ -239,6 +244,7 @@ export class AnamorphicPass extends Pass {
       },
       vertexShader: ANAMORPHIC_VERT,
       fragmentShader: ANAMORPHIC_EXTRACT_FRAG,
+      blending: THREE.NoBlending,
       depthTest: false,
       depthWrite: false,
     });
@@ -252,26 +258,45 @@ export class AnamorphicPass extends Pass {
       },
       vertexShader: ANAMORPHIC_VERT,
       fragmentShader: ANAMORPHIC_BLUR_FRAG,
+      blending: THREE.NoBlending,
       depthTest: false,
       depthWrite: false,
     });
 
-    this.compositeMaterial = new THREE.ShaderMaterial({
-      uniforms: {
-        tDiffuse: { value: null },
-        tCoreStreak: { value: this.rtCore.texture },
-        tWideStreak: { value: this.rtPing.texture },
-        uIntensity: { value: this.intensity },
-        uCoreWeight: { value: this.coreWeight },
-        uWideWeight: { value: this.wideWeight },
-      },
-      vertexShader: ANAMORPHIC_VERT,
-      fragmentShader: ANAMORPHIC_COMPOSITE_FRAG,
-      depthTest: false,
-      depthWrite: false,
-    });
+    this.compositeMaterial = this.compositeToTarget
+      ? new THREE.ShaderMaterial({
+          uniforms: {
+            tDiffuse: { value: null },
+            tCoreStreak: { value: this.rtCore.texture },
+            tWideStreak: { value: this.rtPing.texture },
+            uIntensity: { value: this.intensity },
+            uCoreWeight: { value: this.coreWeight },
+            uWideWeight: { value: this.wideWeight },
+          },
+          vertexShader: ANAMORPHIC_VERT,
+          fragmentShader: ANAMORPHIC_COMPOSITE_FRAG,
+          blending: THREE.NoBlending,
+          depthTest: false,
+          depthWrite: false,
+        })
+      : null;
 
     this.fsQuad = new FullScreenQuad(this.extractMaterial);
+  }
+
+  /** Low-resolution tight core horizontal anamorphic streak texture. */
+  public get coreStreakTexture(): THREE.Texture {
+    return this.rtCore.texture;
+  }
+
+  /** Low-resolution wide screen-spanning horizontal anamorphic streak texture. */
+  public get wideStreakTexture(): THREE.Texture {
+    return this.rtPing.texture;
+  }
+
+  /** Primary low-resolution horizontal streak texture alias. */
+  public get streakTexture(): THREE.Texture {
+    return this.rtPing.texture;
   }
 
   public override setSize(width: number, height: number): void {
@@ -301,12 +326,16 @@ export class AnamorphicPass extends Pass {
 
     // 1. Extract bright highlights into rtPong (anamorphic quarter-pixel buffer)
     this.extractMaterial.uniforms.tDiffuse.value = readBuffer.texture;
+    (this.extractMaterial.uniforms.uInvSrcSize.value as THREE.Vector2).set(
+      1 / Math.max(1, readBuffer.width),
+      1 / Math.max(1, readBuffer.height),
+    );
     this.extractMaterial.uniforms.uThreshold.value = this.threshold;
     this.extractMaterial.uniforms.uKnee.value = this.knee;
     this.extractMaterial.uniforms.uTrip.value = this.tripIntensity;
     this.fsQuad.material = this.extractMaterial;
     renderer.setRenderTarget(this.rtPong);
-    renderer.clear();
+    renderer.clear(true, false, false);
     this.fsQuad.render(renderer);
 
     // 2. Separable progressive horizontal streak blur passes
@@ -319,46 +348,48 @@ export class AnamorphicPass extends Pass {
     this.blurMaterial.uniforms.tDiffuse.value = this.rtPong.texture;
     this.blurMaterial.uniforms.uStride.value = 1.25 * s;
     renderer.setRenderTarget(this.rtCore);
-    renderer.clear();
+    renderer.clear(true, false, false);
     this.fsQuad.render(renderer);
 
     //    Pass B (medium reach) rtCore -> rtPing
     this.blurMaterial.uniforms.tDiffuse.value = this.rtCore.texture;
     this.blurMaterial.uniforms.uStride.value = 3.2 * s;
     renderer.setRenderTarget(this.rtPing);
-    renderer.clear();
+    renderer.clear(true, false, false);
     this.fsQuad.render(renderer);
 
     //    Pass C (wide reach) rtPing -> rtPong
     this.blurMaterial.uniforms.tDiffuse.value = this.rtPing.texture;
     this.blurMaterial.uniforms.uStride.value = 7.4 * s;
     renderer.setRenderTarget(this.rtPong);
-    renderer.clear();
+    renderer.clear(true, false, false);
     this.fsQuad.render(renderer);
 
     //    Pass D (cinema screen-spanning reach) rtPong -> rtPing
     this.blurMaterial.uniforms.tDiffuse.value = this.rtPong.texture;
     this.blurMaterial.uniforms.uStride.value = 14.5 * s;
     renderer.setRenderTarget(this.rtPing);
-    renderer.clear();
+    renderer.clear(true, false, false);
     this.fsQuad.render(renderer);
 
-    // 3. Composite tight core + sweeping wide streaks onto HDR scene
-    this.compositeMaterial.uniforms.tDiffuse.value = readBuffer.texture;
-    this.compositeMaterial.uniforms.tCoreStreak.value = this.rtCore.texture;
-    this.compositeMaterial.uniforms.tWideStreak.value = this.rtPing.texture;
-    this.compositeMaterial.uniforms.uIntensity.value = this.intensity;
-    this.compositeMaterial.uniforms.uCoreWeight.value = this.coreWeight;
-    this.compositeMaterial.uniforms.uWideWeight.value = this.wideWeight;
-    this.fsQuad.material = this.compositeMaterial;
+    // 3. Optional standalone full-res composite (skipped when fused into PostPipeline final pass)
+    if (this.compositeMaterial !== null) {
+      this.compositeMaterial.uniforms.tDiffuse.value = readBuffer.texture;
+      this.compositeMaterial.uniforms.tCoreStreak.value = this.rtCore.texture;
+      this.compositeMaterial.uniforms.tWideStreak.value = this.rtPing.texture;
+      this.compositeMaterial.uniforms.uIntensity.value = this.intensity;
+      this.compositeMaterial.uniforms.uCoreWeight.value = this.coreWeight;
+      this.compositeMaterial.uniforms.uWideWeight.value = this.wideWeight;
+      this.fsQuad.material = this.compositeMaterial;
 
-    if (this.renderToScreen) {
-      renderer.setRenderTarget(null);
-    } else {
-      renderer.setRenderTarget(writeBuffer);
+      if (this.renderToScreen) {
+        renderer.setRenderTarget(null);
+      } else {
+        renderer.setRenderTarget(writeBuffer);
+      }
+      if (this.clear) renderer.clear();
+      this.fsQuad.render(renderer);
     }
-    if (this.clear) renderer.clear();
-    this.fsQuad.render(renderer);
 
     renderer.setClearColor(this._oldClearColor, oldClearAlpha);
     renderer.autoClear = oldAutoClear;
@@ -370,7 +401,9 @@ export class AnamorphicPass extends Pass {
     this.rtPong.dispose();
     this.extractMaterial.dispose();
     this.blurMaterial.dispose();
-    this.compositeMaterial.dispose();
+    if (this.compositeMaterial !== null) {
+      this.compositeMaterial.dispose();
+    }
     this.fsQuad.dispose();
   }
 }
