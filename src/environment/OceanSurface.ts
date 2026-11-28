@@ -301,10 +301,9 @@ const OCEAN_FRAG = /* glsl */ `
     // Base analytical Gerstner wave normal
     vec3 geoN = safeNormalize(vWaveNormal);
 
-    // Construct tangent-space basis around analytical wave normal
-    vec3 upRef = abs(geoN.y) < 0.999 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
-    vec3 T = safeNormalize(cross(upRef, geoN));
-    vec3 B = safeNormalize(cross(geoN, T));
+    // Construct singularity-free tangent-space basis aligned with world XZ (geoN.y >= 0.12)
+    vec3 T = safeNormalize(cross(geoN, vec3(0.0, 0.0, 1.0)));
+    vec3 B = safeNormalize(cross(T, geoN));
 
     // Dual-octave capillary detail normals (wind-advected, distance-attenuated for zero horizon aliasing)
     float detailFade = 1.0 - smoothstep(220.0, 3200.0, dist);
@@ -344,7 +343,7 @@ const OCEAN_FRAG = /* glsl */ `
       }
     }
 
-    vec3 N = safeNormalize(geoN + T * capGrad.x + B * capGrad.y);
+    vec3 N = safeNormalize(geoN - T * capGrad.x - B * capGrad.y);
     if (N.y < 0.08) {
       N = safeNormalize(vec3(N.x, 0.08, N.z));
     }
