@@ -1,9 +1,10 @@
 import * as THREE from 'three';
 
-const INNER_HALF = 1600;
-const INNER_CELL = 20;
-const OUTER_HALF = 8000;
-const OUTER_CELL = 100;
+const RADIAL_RINGS = 84;
+const ANGULAR_SEGMENTS = 112;
+const OCEAN_RADIUS = 9000;
+const RADIAL_LOG_BASE = 220;
+const OCEAN_SNAP_STEP = 40;
 const MAX_SHOCKWAVES = 3;
 const SPRAY_PARTICLE_COUNT = 240;
 
@@ -71,10 +72,11 @@ const OCEAN_VERT = /* glsl */ `
     vec4 wp = modelMatrix * vec4(position, 1.0);
     vec2 xz = wp.xz;
 
-    // Gentle distance fade on shortest Gerstner octaves so far horizon stays silk-smooth
+    // Distance-based LOD weights for Gerstner octaves (full fidelity near/mid, culled beyond fog)
     float camDist = length(cameraPosition.xz - xz);
-    float nearWeight = 1.0 - smoothstep(1400.0, 4800.0, camDist);
-    float midWeight = 1.0 - smoothstep(2600.0, 6800.0, camDist);
+    float farWeight = 1.0 - smoothstep(4600.0, 7400.0, camDist);
+    float midWeight = 1.0 - smoothstep(1400.0, 3200.0, camDist);
+    float nearWeight = 1.0 - smoothstep(1200.0, 2200.0, camDist);
     float stormBoost = 1.0 + uStorm * 0.34;
     float steepBoost = 1.0 + uStorm * 0.22;
 
@@ -82,16 +84,27 @@ const OCEAN_VERT = /* glsl */ `
     vec3 tangent = vec3(1.0, 0.0, 0.0);
     vec3 bitangent = vec3(0.0, 0.0, 1.0);
 
-    // 8 non-harmonic Gerstner wave octaves (Pacific primary swells -> cross-seas -> steep chop)
+    // 8 non-harmonic Gerstner wave octaves with branch-culled radial LOD
     // Total sum(Q * k * A) stays safely <= 0.42 even at peak storm, preventing inverted loops.
-    addGerstnerWave(xz, vec2( 0.841,  0.541), 620.0, 4.40 * stormBoost,            0.66 * steepBoost, 1.45, 0.31, disp, tangent, bitangent);
-    addGerstnerWave(xz, vec2(-0.418,  0.908), 418.0, 3.05 * stormBoost,            0.64 * steepBoost, 1.52, 1.74, disp, tangent, bitangent);
-    addGerstnerWave(xz, vec2( 0.951, -0.309), 292.0, 2.05 * stormBoost,            0.62 * steepBoost, 1.58, 3.19, disp, tangent, bitangent);
-    addGerstnerWave(xz, vec2( 0.553,  0.833), 196.0, 1.38 * stormBoost * midWeight, 0.58 * steepBoost, 1.66, 0.88, disp, tangent, bitangent);
-    addGerstnerWave(xz, vec2(-0.761,  0.649), 138.0, 0.92 * stormBoost * midWeight, 0.56 * steepBoost, 1.74, 4.52, disp, tangent, bitangent);
-    addGerstnerWave(xz, vec2( 0.281, -0.960),  94.0, 0.58 * stormBoost * nearWeight, 0.52 * steepBoost, 1.84, 2.41, disp, tangent, bitangent);
-    addGerstnerWave(xz, vec2(-0.921, -0.390),  68.0, 0.36 * stormBoost * nearWeight, 0.48 * steepBoost, 1.92, 5.13, disp, tangent, bitangent);
-    addGerstnerWave(xz, vec2( 0.682, -0.731),  49.0, 0.22 * stormBoost * nearWeight, 0.44 * steepBoost, 2.02, 1.27, disp, tangent, bitangent);
+    if (farWeight > 0.001) {
+      float primaryScale = stormBoost * farWeight;
+      addGerstnerWave(xz, vec2( 0.841,  0.541), 620.0, 4.40 * primaryScale, 0.66 * steepBoost, 1.45, 0.31, disp, tangent, bitangent);
+      addGerstnerWave(xz, vec2(-0.418,  0.908), 418.0, 3.05 * primaryScale, 0.64 * steepBoost, 1.52, 1.74, disp, tangent, bitangent);
+      addGerstnerWave(xz, vec2( 0.951, -0.309), 292.0, 2.05 * primaryScale, 0.62 * steepBoost, 1.58, 3.19, disp, tangent, bitangent);
+
+      if (midWeight > 0.001) {
+        float midScale = stormBoost * midWeight;
+        addGerstnerWave(xz, vec2( 0.553,  0.833), 196.0, 1.38 * midScale, 0.58 * steepBoost, 1.66, 0.88, disp, tangent, bitangent);
+        addGerstnerWave(xz, vec2(-0.761,  0.649), 138.0, 0.92 * midScale, 0.56 * steepBoost, 1.74, 4.52, disp, tangent, bitangent);
+      }
+
+      if (nearWeight > 0.001) {
+        float nearScale = stormBoost * nearWeight;
+        addGerstnerWave(xz, vec2( 0.281, -0.960),  94.0, 0.58 * nearScale, 0.52 * steepBoost, 1.84, 2.41, disp, tangent, bitangent);
+        addGerstnerWave(xz, vec2(-0.921, -0.390),  68.0, 0.36 * nearScale, 0.48 * steepBoost, 1.92, 5.13, disp, tangent, bitangent);
+        addGerstnerWave(xz, vec2( 0.682, -0.731),  49.0, 0.22 * nearScale, 0.44 * steepBoost, 2.02, 1.27, disp, tangent, bitangent);
+      }
+    }
 
     // Expanding aerial detonation shockwave rings: concentric physical crests + slope normals
     float shockGlow = 0.0;
@@ -102,30 +115,34 @@ const OCEAN_VERT = /* glsl */ `
         float bandScale = uShockParams[i].z;
         vec2 toPt = xz - uShockOrigin[i].xz;
         float distShock = length(toPt);
-        vec2 radDir = distShock > 1e-4 ? toPt / distShock : vec2(1.0, 0.0);
-
         float delta = distShock - radius;
         float envArg = delta * bandScale;
-        float envelope = exp(-(envArg * envArg)) * strength;
 
-        // Concentric harmonic wave train behind the leading pressure front
-        float waveFreq = 0.095;
-        float wavePhase = delta * waveFreq;
-        float amp = 16.5;
-        float waveH = envelope * amp * sin(wavePhase);
+        if (envArg > -4.5 && envArg < 3.8) {
+          vec2 radDir = distShock > 1e-4 ? toPt / distShock : vec2(1.0, 0.0);
+          float envelope = exp(-(envArg * envArg)) * strength;
 
-        // Analytical radial derivative d(waveH)/dr for crisp shockwave normal lighting
-        float dH_dr = envelope * amp * (waveFreq * cos(wavePhase) - 2.0 * envArg * bandScale * sin(wavePhase));
-        dH_dr = clamp(dH_dr, -1.6, 1.6);
+          // Concentric harmonic wave train behind the leading pressure front
+          float waveFreq = 0.095;
+          float wavePhase = delta * waveFreq;
+          float amp = 16.5;
+          float waveH = envelope * amp * sin(wavePhase);
 
-        disp.y += waveH;
-        tangent.y += dH_dr * radDir.x;
-        bitangent.y += dH_dr * radDir.y;
+          // Analytical radial derivative d(waveH)/dr for crisp shockwave normal lighting
+          float dH_dr = envelope * amp * (waveFreq * cos(wavePhase) - 2.0 * envArg * bandScale * sin(wavePhase));
+          dH_dr = clamp(dH_dr, -1.6, 1.6);
 
-        // Sharp leading luminous wavefront + trailing aerated foam ring
-        float leadRing = exp(-((delta * bandScale * 1.65) * (delta * bandScale * 1.65))) * strength;
-        float trailRing = exp(-(((delta + 55.0) * bandScale * 0.95) * ((delta + 55.0) * bandScale * 0.95))) * strength * 0.48;
-        shockGlow = max(shockGlow, leadRing + trailRing);
+          disp.y += waveH;
+          tangent.y += dH_dr * radDir.x;
+          bitangent.y += dH_dr * radDir.y;
+
+          // Sharp leading luminous wavefront + trailing aerated foam ring
+          float leadArg = delta * bandScale * 1.65;
+          float trailArg = (delta + 55.0) * bandScale * 0.95;
+          float leadRing = exp(-(leadArg * leadArg)) * strength;
+          float trailRing = exp(-(trailArg * trailArg)) * strength * 0.48;
+          shockGlow = max(shockGlow, leadRing + trailRing);
+        }
       }
     }
 
@@ -146,26 +163,28 @@ const OCEAN_VERT = /* glsl */ `
         float halfWidth = 6.5 + max(along, 0.0) * 0.105;
         float normAcross = absAcross / max(halfWidth, 1.0);
 
-        // Centre downwash depression flanked by twin raised Kelvin wake ridges
-        float centreTrough = -exp(-(normAcross * normAcross) * 2.6) * 2.4;
-        float ridgeArg = normAcross - 1.0;
-        float twinRidge = exp(-(ridgeArg * ridgeArg) * 7.5) * 1.85;
-        float wakeH = (centreTrough + twinRidge) * alongEnv * uJetWakeStrength;
+        if (normAcross < 2.6) {
+          // Centre downwash depression flanked by twin raised Kelvin wake ridges
+          float centreTrough = -exp(-(normAcross * normAcross) * 2.6) * 2.4;
+          float ridgeArg = normAcross - 1.0;
+          float twinRidge = exp(-(ridgeArg * ridgeArg) * 7.5) * 1.85;
+          float wakeH = (centreTrough + twinRidge) * alongEnv * uJetWakeStrength;
 
-        // Lateral derivative for wake ridge glints
-        float dCentre = 2.0 * 2.6 * normAcross * exp(-(normAcross * normAcross) * 2.6) * 2.4;
-        float dRidge = -2.0 * 7.5 * ridgeArg * exp(-(ridgeArg * ridgeArg) * 7.5) * 1.85;
-        float dH_dAcross = ((dCentre + dRidge) / max(halfWidth, 1.0)) * alongEnv * uJetWakeStrength * (across >= 0.0 ? 1.0 : -1.0);
-        dH_dAcross = clamp(dH_dAcross, -0.75, 0.75);
+          // Lateral derivative for wake ridge glints
+          float dCentre = 2.0 * 2.6 * normAcross * exp(-(normAcross * normAcross) * 2.6) * 2.4;
+          float dRidge = -2.0 * 7.5 * ridgeArg * exp(-(ridgeArg * ridgeArg) * 7.5) * 1.85;
+          float dH_dAcross = ((dCentre + dRidge) / max(halfWidth, 1.0)) * alongEnv * uJetWakeStrength * (across >= 0.0 ? 1.0 : -1.0);
+          dH_dAcross = clamp(dH_dAcross, -0.75, 0.75);
 
-        disp.y += wakeH;
-        tangent.y += dH_dAcross * jetRight.x;
-        bitangent.y += dH_dAcross * jetRight.y;
+          disp.y += wakeH;
+          tangent.y += dH_dAcross * jetRight.x;
+          bitangent.y += dH_dAcross * jetRight.y;
 
-        // Aerated jet-wash centre scar + twin foam arms
-        float centreFoam = exp(-(normAcross * normAcross) * 1.8);
-        float armFoam = exp(-(ridgeArg * ridgeArg) * 9.0) * 0.92;
-        wakeFoam = clamp((centreFoam + armFoam) * alongEnv * uJetWakeStrength, 0.0, 1.35);
+          // Aerated jet-wash centre scar + twin foam arms
+          float centreFoam = exp(-(normAcross * normAcross) * 1.8);
+          float armFoam = exp(-(ridgeArg * ridgeArg) * 9.0) * 0.92;
+          wakeFoam = clamp((centreFoam + armFoam) * alongEnv * uJetWakeStrength, 0.0, 1.35);
+        }
       }
     }
 
@@ -246,16 +265,26 @@ const OCEAN_FRAG = /* glsl */ `
     return vec3(val, grad);
   }
 
-  float fbmFoam(vec2 p) {
-    float v = 0.0;
-    float a = 0.5;
+  // Distance-LOD foam fBM: smoothly tapers octaves 3 -> 2 -> 1 while preserving mean energy
+  float fbmFoamLod(vec2 p, float lodWeight) {
     mat2 rot = mat2(0.8, 0.6, -0.6, 0.8);
-    for (int i = 0; i < 3; i++) {
-      v += a * noise2DGrad(p).x;
+    float v = noise2DGrad(p).x;
+    float wSum = 1.0;
+    float w2 = smoothstep(0.0, 0.55, lodWeight);
+    if (w2 > 0.002) {
       p = rot * p * 2.07;
-      a *= 0.5;
+      float a2 = 0.5 * w2;
+      v += a2 * noise2DGrad(p).x;
+      wSum += a2;
+      float w3 = smoothstep(0.35, 0.90, lodWeight);
+      if (w3 > 0.002) {
+        p = rot * p * 2.07;
+        float a3 = 0.25 * w3;
+        v += a3 * noise2DGrad(p).x;
+        wSum += a3;
+      }
     }
-    return v;
+    return (v / max(wSum, 1e-4)) * 0.875;
   }
 
   vec3 hsv2rgb(vec3 c) {
@@ -265,7 +294,7 @@ const OCEAN_FRAG = /* glsl */ `
   }
 
   // Procedural sky reflection matching SkyAndClouds horizon, zenith, and twin-eclipse sun
-  vec3 sampleSkyReflection(vec3 R, vec3 L, float storm, float trip) {
+  vec3 sampleSkyReflection(vec3 R, vec3 L, float storm, float trip, float reflDetail) {
     float ry = clamp(R.y, 0.0, 1.0);
     float horizonCurve = pow(max(1.0 - ry, 1e-4), 2.4);
 
@@ -284,40 +313,56 @@ const OCEAN_FRAG = /* glsl */ `
     vec3 sunTint = mix(vec3(1.25, 0.65, 0.28), vec3(1.15, 0.34, 0.92), clamp(trip * 0.55, 0.0, 1.0));
     sky += sunTint * mieGlow * (1.0 - storm * 0.35);
 
-    // Subtle reflected cloud-deck silhouette bands
-    vec2 cloudUv = R.xz / max(ry + 0.24, 0.24);
-    float cloudBand = fbmFoam(cloudUv * 0.65 + vec2(uTime * 0.014, -uTime * 0.01));
-    vec3 cloudTint = mix(vec3(0.92, 0.48, 0.24), vec3(0.14, 0.10, 0.24), storm);
-    sky = mix(sky, cloudTint, smoothstep(0.45, 0.82, cloudBand) * (0.24 + 0.32 * storm));
+    // Subtle reflected cloud-deck silhouette bands (distance-culled past mid-far haze)
+    if (reflDetail > 0.002) {
+      vec2 cloudUv = R.xz / max(ry + 0.24, 0.24);
+      float cloudBand = fbmFoamLod(cloudUv * 0.65 + vec2(uTime * 0.014, -uTime * 0.01), reflDetail);
+      vec3 cloudTint = mix(vec3(0.92, 0.48, 0.24), vec3(0.14, 0.10, 0.24), storm);
+      sky = mix(sky, cloudTint, smoothstep(0.45, 0.82, cloudBand) * (0.24 + 0.32 * storm) * reflDetail);
+    }
 
     return sky;
   }
 
   void main() {
+    float dist = length(cameraPosition - vWorldPos);
+
+    // Atmospheric horizon fog — early-out beyond full fog cutoff saves heavy horizon ALU
+    float fogAmt = smoothstep(1100.0, 7200.0, dist);
+    vec3 fogCol = mix(vec3(0.82, 0.42, 0.21), vec3(0.18, 0.13, 0.26), uStorm);
+    if (uTrip > 0.05) {
+      fogCol = mix(fogCol, vec3(0.32, 0.09, 0.44), clamp(uTrip * 0.55, 0.0, 0.65));
+    }
+    if (fogAmt >= 0.999) {
+      gl_FragColor = vec4(clamp(fogCol, 0.0, 10.0), 1.0);
+      return;
+    }
+
     vec3 V = safeNormalize(cameraPosition - vWorldPos);
     vec3 L = safeNormalize(uSunDir);
-    float dist = length(cameraPosition - vWorldPos);
 
     // Base analytical Gerstner wave normal
     vec3 geoN = safeNormalize(vWaveNormal);
 
-    // Construct singularity-free tangent-space basis aligned with world XZ (geoN.y >= 0.12)
-    vec3 T = safeNormalize(cross(geoN, vec3(0.0, 0.0, 1.0)));
-    vec3 B = safeNormalize(cross(T, geoN));
-
-    // Dual-octave capillary detail normals (wind-advected, distance-attenuated for zero horizon aliasing)
-    float detailFade = 1.0 - smoothstep(220.0, 3200.0, dist);
-    float microFade = 1.0 - smoothstep(90.0, 1250.0, dist);
-
-    vec2 capUv1 = vWorldPos.xz * 0.085 + vec2(uTime * 0.52, -uTime * 0.38);
-    vec2 capUv2 = vWorldPos.xz * 0.235 + vec2(-uTime * 0.74, uTime * 0.61);
-    vec3 cap1 = noise2DGrad(capUv1);
-    vec3 cap2 = noise2DGrad(capUv2);
-
+    // Dual-octave capillary detail normals (wind-advected, branch-culled beyond mid-distance)
+    float detailFade = 1.0 - smoothstep(320.0, 2600.0, dist);
+    float microFade = 1.0 - smoothstep(120.0, 1250.0, dist);
     float stormChop = 1.0 + uStorm * 0.45;
-    vec2 capGrad =
-      cap1.yz * (0.19 * detailFade * stormChop) +
-      cap2.yz * (0.11 * microFade * stormChop);
+
+    float cap1Val = 0.5;
+    vec2 capGrad = vec2(0.0);
+    if (detailFade > 0.002) {
+      vec2 capUv1 = vWorldPos.xz * 0.085 + vec2(uTime * 0.52, -uTime * 0.38);
+      vec3 cap1 = noise2DGrad(capUv1);
+      cap1Val = mix(0.5, cap1.x, smoothstep(0.002, 0.16, detailFade));
+      capGrad += cap1.yz * (0.20 * detailFade * stormChop);
+
+      if (microFade > 0.002) {
+        vec2 capUv2 = vWorldPos.xz * 0.235 + vec2(-uTime * 0.74, uTime * 0.61);
+        vec3 cap2 = noise2DGrad(capUv2);
+        capGrad += cap2.yz * (0.12 * microFade * stormChop);
+      }
+    }
 
     // Extra fine surface chop disturbance inside the jet wake
     float fineWakeFoam = 0.0;
@@ -331,21 +376,32 @@ const OCEAN_FRAG = /* glsl */ `
       if (alongEnv > 0.002) {
         float halfW = 5.5 + max(along, 0.0) * 0.105;
         float normAcross = across / max(halfW, 1.0);
-        float turb = fbmFoam(vec2(along * 0.08 - uTime * 2.8, across * 0.14));
-        float centreStreak = exp(-(normAcross * normAcross) * 2.2) * (0.55 + 0.75 * turb);
-        float armArg = normAcross - 1.0;
-        float twinArms = exp(-(armArg * armArg) * 10.5) * (0.65 + 0.65 * turb);
-        fineWakeFoam = clamp((centreStreak + twinArms) * alongEnv * uJetWakeStrength, 0.0, 1.25);
+        if (normAcross < 2.5) {
+          float wakeLod = 1.0 - smoothstep(900.0, 2200.0, dist);
+          float turb = fbmFoamLod(vec2(along * 0.08 - uTime * 2.8, across * 0.14), wakeLod);
+          float centreStreak = exp(-(normAcross * normAcross) * 2.2) * (0.55 + 0.75 * turb);
+          float armArg = normAcross - 1.0;
+          float twinArms = exp(-(armArg * armArg) * 10.5) * (0.65 + 0.65 * turb);
+          fineWakeFoam = clamp((centreStreak + twinArms) * alongEnv * uJetWakeStrength, 0.0, 1.25);
 
-        // High-frequency turbulent jet-wash normal perturbation
-        vec3 wakeCap = noise2DGrad(vec2(along * 0.24 - uTime * 4.5, across * 0.34));
-        capGrad += wakeCap.yz * (0.36 * fineWakeFoam * detailFade);
+          // High-frequency turbulent jet-wash normal perturbation
+          if (detailFade > 0.002) {
+            vec3 wakeCap = noise2DGrad(vec2(along * 0.24 - uTime * 4.5, across * 0.34));
+            capGrad += wakeCap.yz * (0.36 * fineWakeFoam * detailFade);
+          }
+        }
       }
     }
 
-    vec3 N = safeNormalize(geoN - T * capGrad.x - B * capGrad.y);
-    if (N.y < 0.08) {
-      N = safeNormalize(vec3(N.x, 0.08, N.z));
+    // Perturb wave normal only when capillary gradients are active
+    vec3 N = geoN;
+    if (dot(capGrad, capGrad) > 1e-8) {
+      vec3 T = safeNormalize(cross(geoN, vec3(0.0, 0.0, 1.0)));
+      vec3 B = safeNormalize(cross(T, geoN));
+      N = safeNormalize(geoN - T * capGrad.x - B * capGrad.y);
+      if (N.y < 0.08) {
+        N = safeNormalize(vec3(N.x, 0.08, N.z));
+      }
     }
 
     float ndotv = max(dot(N, V), 1e-4);
@@ -383,14 +439,15 @@ const OCEAN_FRAG = /* glsl */ `
     R = safeNormalize(R);
 
     float fresnel = 0.02 + 0.98 * pow(max(1.0 - ndotv, 1e-4), 5.0);
-    vec3 skyReflect = sampleSkyReflection(R, L, uStorm, uTrip);
+    float reflDetail = 1.0 - smoothstep(1600.0, 4000.0, dist);
+    vec3 skyReflect = sampleSkyReflection(R, L, uStorm, uTrip, reflDetail);
 
     // Psychedelic liquid-chrome oil-slick iridescence during LSD acts (Acts III-IV)
     if (uTrip > 0.02) {
       float oilPhase =
         vWorldPos.x * 0.0032 +
         vWorldPos.z * 0.0032 +
-        cap1.x * 1.65 +
+        cap1Val * 1.65 +
         (1.0 - ndotv) * 1.35 -
         uTime * 0.28;
       vec3 liquidChrome = hsv2rgb(vec3(fract(oilPhase), 0.86, 1.0));
@@ -401,15 +458,23 @@ const OCEAN_FRAG = /* glsl */ `
     vec3 col = mix(waterBody, skyReflect, clamp(fresnel * 0.94 + 0.04, 0.0, 0.98));
 
     // ------------------------------------------------------------------
-    // 3. WIND-BLOWN FOAM CRESTS & JET WAKE DISTURBANCE
+    // 3. WIND-BLOWN FOAM CRESTS & JET WAKE DISTURBANCE (DISTANCE-CULLED)
     // ------------------------------------------------------------------
-    vec2 foamUv = vWorldPos.xz * 0.045 + vec2(uTime * 0.22, -uTime * 0.16);
-    float foamPattern = fbmFoam(foamUv);
-    float foamLace = smoothstep(0.38, 0.78, foamPattern + vCrestFold * 0.42 + uStorm * 0.14);
+    float foamLod = 1.0 - smoothstep(1200.0, 3200.0, dist);
+    float foamPattern = 0.44;
+    float crestFoam = 0.0;
+    if (foamLod > 0.002 || vShockGlow > 0.002) {
+      vec2 foamUv = vWorldPos.xz * 0.045 + vec2(uTime * 0.22, -uTime * 0.16);
+      foamPattern = fbmFoamLod(foamUv, max(foamLod, vShockGlow));
+      if (foamLod > 0.002) {
+        float foamLace = smoothstep(0.38, 0.78, foamPattern + vCrestFold * 0.42 + uStorm * 0.14);
+        crestFoam =
+          smoothstep(0.24, 0.78, vCrestFold + smoothstep(2.4, 7.6, vWaveHeight) * 0.55 + uStorm * 0.18) *
+          (0.32 + 0.68 * foamLace) *
+          foamLod;
+      }
+    }
 
-    float crestFoam =
-      smoothstep(0.24, 0.78, vCrestFold + smoothstep(2.4, 7.6, vWaveHeight) * 0.55 + uStorm * 0.18) *
-      (0.32 + 0.68 * foamLace);
     float totalWakeFoam = clamp(max(vWakeFoam * 0.75, fineWakeFoam), 0.0, 1.0);
     float foamMask = clamp(crestFoam * (0.48 + uStorm * 0.42) + totalWakeFoam * 0.92, 0.0, 1.0);
 
@@ -468,11 +533,6 @@ const OCEAN_FRAG = /* glsl */ `
     // ------------------------------------------------------------------
     // 6. SEAMLESS ATMOSPHERIC HORIZON HAZE BLEND
     // ------------------------------------------------------------------
-    float fogAmt = smoothstep(1100.0, 7200.0, dist);
-    vec3 fogCol = mix(vec3(0.82, 0.42, 0.21), vec3(0.18, 0.13, 0.26), uStorm);
-    if (uTrip > 0.05) {
-      fogCol = mix(fogCol, vec3(0.32, 0.09, 0.44), clamp(uTrip * 0.55, 0.0, 0.65));
-    }
     col = mix(col, fogCol, fogAmt);
 
     gl_FragColor = vec4(clamp(col, 0.0, 10.0), 1.0);
@@ -625,80 +685,79 @@ interface ShockwaveSlot {
 }
 
 /**
- * Builds a watertight two-tier ocean clipmap:
- * - Inner hi-res patch [-1600, +1600] at 20-unit spacing, with its perimeter ring
- *   snapped cleanly to exact 100-unit outer stations so there are zero T-junction cracks.
- * - Outer horizon ring [-8000, +8000] at 100-unit spacing, omitting inner-patch quads.
+ * Builds a seamless concentric logarithmic radial LOD ocean mesh centred at (0, 0, 0):
+ * - Ultra-dense near-camera swells within r < 500 (ring spacing 2.7..33 units)
+ * - Near-isotropic (~1.15:1) logarithmic quads out to r = 9000 beyond the fog horizon
+ * - 18,704 total triangles (58.4% fewer than a 150x150 uniform grid, 81.4% fewer than
+ *   the previous two-tier clipmap) with shared seam-free wrap indices and zero T-junctions.
  */
-function buildClipmapOceanGeometry(): THREE.BufferGeometry {
-  const innerSegs = (INNER_HALF * 2) / INNER_CELL; // 160
-  const outerSegs = (OUTER_HALF * 2) / OUTER_CELL; // 160
-  const innerCols = innerSegs + 1;
-  const outerCols = outerSegs + 1;
+function buildRadialLodOceanGeometry(): THREE.BufferGeometry {
+  const vertexCount = 1 + RADIAL_RINGS * ANGULAR_SEGMENTS;
+  const positions = new Float32Array(vertexCount * 3);
 
-  const positions: number[] = [];
-  const indices: number[] = [];
+  // Centre pole at (0, 0, 0)
+  positions[0] = 0;
+  positions[1] = 0;
+  positions[2] = 0;
 
-  // 1. Inner high-resolution mesh (snaps perimeter ring to exact OUTER_CELL multiples)
-  for (let iz = 0; iz <= innerSegs; iz++) {
-    const rawZ = -INNER_HALF + iz * INNER_CELL;
-    const onZEdge = iz === 0 || iz === innerSegs;
-    for (let ix = 0; ix <= innerSegs; ix++) {
-      const rawX = -INNER_HALF + ix * INNER_CELL;
-      const onXEdge = ix === 0 || ix === innerSegs;
+  const invLogSpan = OCEAN_RADIUS / (RADIAL_LOG_BASE - 1);
+  const twoPi = Math.PI * 2;
+  const cosTable = new Float64Array(ANGULAR_SEGMENTS);
+  const sinTable = new Float64Array(ANGULAR_SEGMENTS);
+  for (let k = 0; k < ANGULAR_SEGMENTS; k++) {
+    const theta = (k / ANGULAR_SEGMENTS) * twoPi;
+    cosTable[k] = Math.cos(theta);
+    sinTable[k] = Math.sin(theta);
+  }
 
-      const x = onZEdge ? Math.round(rawX / OUTER_CELL) * OUTER_CELL : rawX;
-      const z = onXEdge ? Math.round(rawZ / OUTER_CELL) * OUTER_CELL : rawZ;
-      positions.push(x, 0, z);
+  let vOffset = 3;
+  for (let ring = 1; ring <= RADIAL_RINGS; ring++) {
+    const t = ring / RADIAL_RINGS;
+    const r = invLogSpan * (Math.pow(RADIAL_LOG_BASE, t) - 1);
+    for (let k = 0; k < ANGULAR_SEGMENTS; k++) {
+      positions[vOffset++] = r * cosTable[k];
+      positions[vOffset++] = 0;
+      positions[vOffset++] = r * sinTable[k];
     }
   }
 
-  for (let iz = 0; iz < innerSegs; iz++) {
-    for (let ix = 0; ix < innerSegs; ix++) {
-      const a = iz * innerCols + ix;
-      const b = a + 1;
-      const c = a + innerCols;
-      const d = c + 1;
-      // Counter-clockwise when viewed from +Y -> outward upward (+Y) front faces
-      indices.push(a, c, b);
-      indices.push(b, c, d);
-    }
+  const triCount = ANGULAR_SEGMENTS * (2 * RADIAL_RINGS - 1);
+  const indices = new Uint16Array(triCount * 3);
+  let iOffset = 0;
+
+  // Inner centre fan (CCW from +Y -> strictly outward upward +Y front faces)
+  for (let k = 0; k < ANGULAR_SEGMENTS; k++) {
+    const kNext = (k + 1) % ANGULAR_SEGMENTS;
+    indices[iOffset++] = 0;
+    indices[iOffset++] = 1 + kNext;
+    indices[iOffset++] = 1 + k;
   }
 
-  // 2. Outer horizon mesh with central [-INNER_HALF, +INNER_HALF] cutout
-  const outerBaseVertex = positions.length / 3;
-  for (let oz = 0; oz <= outerSegs; oz++) {
-    const z = -OUTER_HALF + oz * OUTER_CELL;
-    for (let ox = 0; ox <= outerSegs; ox++) {
-      const x = -OUTER_HALF + ox * OUTER_CELL;
-      positions.push(x, 0, z);
-    }
-  }
-
-  for (let oz = 0; oz < outerSegs; oz++) {
-    const z0 = -OUTER_HALF + oz * OUTER_CELL;
-    const z1 = z0 + OUTER_CELL;
-    for (let ox = 0; ox < outerSegs; ox++) {
-      const x0 = -OUTER_HALF + ox * OUTER_CELL;
-      const x1 = x0 + OUTER_CELL;
-      // Skip quads covered by the high-resolution inner patch
-      if (x0 >= -INNER_HALF && x1 <= INNER_HALF && z0 >= -INNER_HALF && z1 <= INNER_HALF) {
-        continue;
-      }
-      const a = outerBaseVertex + oz * outerCols + ox;
-      const b = a + 1;
-      const c = a + outerCols;
-      const d = c + 1;
-      indices.push(a, c, b);
-      indices.push(b, c, d);
+  // Concentric logarithmic ring strips with shared vertices across theta = 0/2pi
+  for (let ring = 1; ring < RADIAL_RINGS; ring++) {
+    const innerStart = 1 + (ring - 1) * ANGULAR_SEGMENTS;
+    const outerStart = 1 + ring * ANGULAR_SEGMENTS;
+    for (let k = 0; k < ANGULAR_SEGMENTS; k++) {
+      const kNext = (k + 1) % ANGULAR_SEGMENTS;
+      const a = innerStart + k;
+      const b = innerStart + kNext;
+      const c = outerStart + k;
+      const d = outerStart + kNext;
+      // Right-handed outward +Y winding: (b - a) x (c - a) = +Y
+      indices[iOffset++] = a;
+      indices[iOffset++] = b;
+      indices[iOffset++] = c;
+      indices[iOffset++] = b;
+      indices[iOffset++] = d;
+      indices[iOffset++] = c;
     }
   }
 
   const geo = new THREE.BufferGeometry();
-  geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
-  geo.setIndex(indices);
+  geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geo.setIndex(new THREE.BufferAttribute(indices, 1));
   // Generous bounding sphere so frustum culling never clips displaced ocean horizons
-  geo.boundingSphere = new THREE.Sphere(new THREE.Vector3(0, 0, 0), OUTER_HALF * 1.5);
+  geo.boundingSphere = new THREE.Sphere(new THREE.Vector3(0, 0, 0), OCEAN_RADIUS * 1.25);
   return geo;
 }
 
@@ -785,7 +844,7 @@ export class OceanSurface {
       },
     });
 
-    const oceanGeo = buildClipmapOceanGeometry();
+    const oceanGeo = buildRadialLodOceanGeometry();
     this.oceanMesh = new THREE.Mesh(oceanGeo, this.oceanMat);
     this.oceanMesh.frustumCulled = false;
     this.oceanMesh.position.y = 0;
@@ -835,9 +894,9 @@ export class OceanSurface {
     heroPos: THREE.Vector3,
     heroForward: THREE.Vector3,
   ): void {
-    // Snap two-tier ocean clipmap to exact OUTER_CELL lattice around camera (zero vertex swimming)
-    this.oceanMesh.position.x = Math.round(cameraPos.x / OUTER_CELL) * OUTER_CELL;
-    this.oceanMesh.position.z = Math.round(cameraPos.z / OUTER_CELL) * OUTER_CELL;
+    // Snap concentric radial LOD ocean to exact lattice around camera XZ (zero vertex swimming)
+    this.oceanMesh.position.x = Math.round(cameraPos.x / OCEAN_SNAP_STEP) * OCEAN_SNAP_STEP;
+    this.oceanMesh.position.z = Math.round(cameraPos.z / OCEAN_SNAP_STEP) * OCEAN_SNAP_STEP;
 
     // Advance expanding concentric shockwave rings
     for (let i = 0; i < MAX_SHOCKWAVES; i++) {
