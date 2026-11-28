@@ -338,7 +338,7 @@ body.no-letterbox .letterbox-bottom {
   bottom: max(12px, env(safe-area-inset-bottom));
   transform: translateX(-50%);
   z-index: 25;
-  width: min(880px, 94vw);
+  width: min(940px, 95vw);
   padding: 9px 14px;
   border-radius: 10px;
   background: rgba(8, 12, 20, 0.78);
@@ -466,12 +466,37 @@ input[type='range'] {
   color: #ffd3f8;
 }
 
+.perf-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.drs-btn {
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  padding: 4px 8px;
+}
+
+.drs-btn.active {
+  background: rgba(56, 224, 178, 0.22);
+  border-color: rgba(88, 255, 204, 0.72);
+  color: #caffef;
+}
+
+.drs-btn.drs-native {
+  background: rgba(255, 168, 56, 0.22);
+  border-color: rgba(255, 194, 96, 0.72);
+  color: #ffe8bd;
+}
+
 .perf-readout {
   font-family: 'SF Mono', ui-monospace, monospace;
   font-size: 10px;
   color: rgba(145, 255, 200, 0.75);
-  min-width: 48px;
+  min-width: 92px;
   text-align: right;
+  white-space: nowrap;
 }
 
 /* Responsive tablet & compact desktop layouts */

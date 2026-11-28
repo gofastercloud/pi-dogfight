@@ -53,6 +53,7 @@
             <span><strong>1–5</strong> Cameras</span>
             <span><strong>H</strong> HUD</span>
             <span><strong>L</strong> LSD Overdrive</span>
+            <span><strong>Q</strong> DRS</span>
             <span><strong>M</strong> Mute</span>
           </div>
         </div>
@@ -101,7 +102,17 @@
             <span id="trip-value">AUTO</span>
           </div>
 
-          <div class="perf-readout" id="perf-readout">60 FPS</div>
+          <div class="perf-group">
+            <button
+              id="btn-drs"
+              class="dock-btn drs-btn active"
+              title="Dynamic Resolution Scaler: AUTO / NATIVE (Q)"
+              aria-pressed="true"
+            >
+              DRS: AUTO
+            </button>
+            <div class="perf-readout" id="perf-readout">60 FPS</div>
+          </div>
         </div>
       </div>
     </div>
