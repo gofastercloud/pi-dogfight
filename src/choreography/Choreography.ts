@@ -2,8 +2,9 @@ import * as THREE from 'three';
 import { FighterJet } from '../aircraft/FighterJet';
 import { BayhemVFX, GuidedMissile } from '../vfx/BayhemVFX';
 import { WorldEnvironment } from '../environment/WorldEnvironment';
+import { CameraDirector, CameraDirectorContext, CameraMode } from './CameraDirector';
 
-export type CameraMode = 'auto' | 'cockpit' | 'chase' | 'orbit' | 'cinematic';
+export type { CameraMode } from './CameraDirector';
 
 export interface RadioCue {
   id: string;
@@ -89,6 +90,55 @@ export const RADIO_CUES: RadioCue[] = [
   },
 ];
 
+interface DebrisTrailSlot {
+  active: boolean;
+  pos: THREE.Vector3;
+  vel: THREE.Vector3;
+  age: number;
+  duration: number;
+  emitAccum: number;
+  splashed: boolean;
+  prism: boolean;
+}
+
+const RADIO_EVENT_KEYS: readonly string[] = RADIO_CUES.map((cue) => `radio_${cue.id}`);
+
+const MACROSS_MISSILE_IDS: readonly string[] = [
+  'macross_0',
+  'macross_1',
+  'macross_2',
+  'macross_3',
+  'macross_4',
+  'macross_5',
+  'macross_6',
+  'macross_7',
+];
+
+const KILL_TIME_W2 = 24.5;
+const KILL_TIME_W1 = 37.1;
+const KILL_TIME_W3 = 47.6;
+const KILL_TIME_W4 = 49.4;
+const KILL_TIME_ACE = 69.45;
+
+const SCHEDULED_EVENTS: readonly (readonly [string, number])[] = [
+  ['flyby1', 6.5],
+  ['guns1', 20.8],
+  ['kill_w2', KILL_TIME_W2],
+  ['flares1', 27.4],
+  ['missile_w1', 33.8],
+  ['kill_w1_fallback', KILL_TIME_W1],
+  ['flares2', 41.5],
+  ['missile_w3', 44.5],
+  ['flares3', 44.8],
+  ['missile_w4', 46.2],
+  ['kill_w3_fallback', KILL_TIME_W3],
+  ['kill_w4_fallback', KILL_TIME_W4],
+  ['cobra_boom', 56.8],
+  ['macross_salvo', 64.0],
+  ['kill_ace_fallback', KILL_TIME_ACE],
+  ['finale_boom', 81.2],
+];
+
 export class DogfightChoreography {
   public readonly hero: FighterJet;
   public readonly bandits: FighterJet[];
@@ -105,28 +155,39 @@ export class DogfightChoreography {
   public lockedTarget: FighterJet | null = null;
   public isMissileLocked = false;
 
+  private readonly director = new CameraDirector();
   private readonly heroCurve: THREE.CatmullRomCurve3;
+  private readonly idleHeroCurve: THREE.CatmullRomCurve3;
   private readonly banditCurves: THREE.CatmullRomCurve3[];
   private readonly triggeredEvents = new Set<string>();
   private readonly vfx: BayhemVFX;
   private readonly env: WorldEnvironment;
   private readonly callbacks: ChoreographyCallbacks;
 
+  private readonly debrisTrails: DebrisTrailSlot[] = [];
+
+  private hasLaunchedOrReset = false;
   private currentActIdx = -1;
   private featuredMissile: GuidedMissile | null = null;
   private gunTimer = 0;
-  private smoothCamPos = new THREE.Vector3(0, 48, 120);
-  private smoothCamLook = new THREE.Vector3(0, 42, -100);
-  private lastShotCutId = '';
+  private sprayTimer = 0;
+  private lastIsPlaying = false;
+
+  // Pre-allocated scratch vectors & reusable structures (zero per-frame heap allocations)
   private readonly _pos = new THREE.Vector3();
   private readonly _fwd = new THREE.Vector3();
-  private readonly _desiredPos = new THREE.Vector3();
-  private readonly _desiredLook = new THREE.Vector3();
-  private readonly _jetUp = new THREE.Vector3();
-  private readonly _shakeVec = new THREE.Vector3();
-  private readonly _auxVec = new THREE.Vector3();
-  private readonly _mDir = new THREE.Vector3();
-  private readonly _supernovaFocus = new THREE.Vector3(55, 530, -1495);
+  private readonly _tangent = new THREE.Vector3();
+  private readonly _nextTangent = new THREE.Vector3();
+  private readonly _aim = new THREE.Vector3();
+  private readonly _origin = new THREE.Vector3();
+  private readonly _initVel = new THREE.Vector3();
+  private readonly _offset = new THREE.Vector3();
+  private readonly _launchDir = new THREE.Vector3();
+  private readonly _secPos = new THREE.Vector3();
+  private readonly _w2KillPos = new THREE.Vector3(10, 165, -1480);
+  private readonly _supernovaFocus = new THREE.Vector3(35, 528, -1545);
+  private readonly _updateResult = { tripIntensity: 0 };
+  private readonly _camCtx: CameraDirectorContext;
 
   constructor(
     scene: THREE.Scene,
@@ -153,157 +214,258 @@ export class DogfightChoreography {
     }
     this.vfx.registerContrails(this.allJets);
 
+    // Pre-allocate 5 flaming debris trail slots (one per enemy kill)
+    for (let i = 0; i < 5; i++) {
+      this.debrisTrails.push({
+        active: false,
+        pos: new THREE.Vector3(),
+        vel: new THREE.Vector3(),
+        age: 0,
+        duration: 3.4,
+        emitAccum: 0,
+        splashed: false,
+        prism: false,
+      });
+    }
+
     // ------------------------------------------------------------------
     // HERO 88-SECOND FLIGHT SPLINE (GOLDEN CANYON -> SUPERCELL -> COBRA -> SUNRISE)
     // ------------------------------------------------------------------
     this.heroCurve = new THREE.CatmullRomCurve3(
       [
-        // Act I: Low ocean-skimming break between basalt sea-stacks
-        new THREE.Vector3(0, 32, 160),
-        new THREE.Vector3(-42, 26, -180),
-        new THREE.Vector3(58, 48, -560),
-        new THREE.Vector3(-84, 72, -940),
-        // Act II: Aggressive canyon weave & guns pass on WRAITH-2
-        new THREE.Vector3(110, 125, -1320),
-        new THREE.Vector3(-125, 168, -1680),
-        new THREE.Vector3(75, 225, -2060),
-        new THREE.Vector3(-90, 290, -2360),
-        // Act III: High-G climb into the Chromatic Supercell Amphitheatre
-        new THREE.Vector3(-340, 415, -1980),
-        new THREE.Vector3(-220, 520, -1480),
-        new THREE.Vector3(240, 565, -1240),
-        new THREE.Vector3(380, 540, -1690),
-        // Act IV: Spiralling dogfight vs Crimson-1 inside obsidian monolith rings + Cobra
-        new THREE.Vector3(95, 515, -1940),
-        new THREE.Vector3(-230, 535, -1610),
-        new THREE.Vector3(15, 520, -1420), // Cobra & 6-missile Macross salvo sweet-spot!
-        new THREE.Vector3(210, 495, -1720),
-        // Act V: Shockwave dive over glassy sea -> dead-vertical climb into the twin sun!
-        new THREE.Vector3(80, 145, -1980),
-        new THREE.Vector3(-35, 62, -2380),
-        new THREE.Vector3(-95, 280, -2680),
-        new THREE.Vector3(-190, 780, -2960),
+        // Act I (0–14s): Low ocean-skimming break & near-miss past basalt sea-stacks
+        new THREE.Vector3(0, 26, 220),
+        new THREE.Vector3(-48, 24, -80),
+        new THREE.Vector3(-92, 34, -340), // Sea-stack near-miss inside [-210, -320]
+        new THREE.Vector3(96, 56, -610),  // Sweeps past [230, -480] during Act I barrel roll
+        // Act II (14–32s): Aggressive canyon merge & cockpit Vulcan pass on WRAITH-2
+        new THREE.Vector3(-95, 92, -960),
+        new THREE.Vector3(78, 142, -1310),
+        new THREE.Vector3(-88, 188, -1660),
+        new THREE.Vector3(65, 255, -2040),
+        // Act III (32–52s): High-G climb into Chromatic Supercell & Monolith Cathedral
+        new THREE.Vector3(-135, 365, -2220),
+        new THREE.Vector3(-275, 475, -1820),
+        new THREE.Vector3(-155, 525, -1360),
+        new THREE.Vector3(175, 555, -1210),
+        // Act IV (52–76s): Head-on duel vs CRIMSON-1, inverted Cobra & 8-missile Macross salvo
+        new THREE.Vector3(260, 540, -1580),
+        new THREE.Vector3(60, 522, -1720),
+        new THREE.Vector3(-25, 520, -1410), // Inverted Pugachev's Cobra bullet-time apex!
+        new THREE.Vector3(15, 515, -1220),  // 8-missile Macross prism salvo release!
+        new THREE.Vector3(165, 505, -1440), // Sweeping high bank around central monolith cathedral
+        new THREE.Vector3(155, 465, -1740), // Banking clear of CRIMSON-1 thermobaric supernova
+        // Act V (76–88s): Shockwave dive -> glassy ocean victory roll -> vertical sunrise climb!
+        new THREE.Vector3(65, 195, -2080),
+        new THREE.Vector3(-35, 72, -2420),
+        new THREE.Vector3(-90, 250, -2640),
+        new THREE.Vector3(-145, 760, -2800),
       ],
       false,
       'catmullrom',
       0.5,
     );
 
+    // Closed golden-hour ocean canyon loop for the live pre-launch title screen fly-past
+    this.idleHeroCurve = new THREE.CatmullRomCurve3(
+      [
+        new THREE.Vector3(-18, 28, 160),
+        new THREE.Vector3(-74, 25, -220),
+        new THREE.Vector3(62, 36, -620),
+        new THREE.Vector3(-42, 46, -980),
+        new THREE.Vector3(115, 42, -560),
+        new THREE.Vector3(88, 30, -80),
+      ],
+      true,
+      'catmullrom',
+      0.5,
+    );
+
     // ------------------------------------------------------------------
-    // 5 BANDIT SPLINES CHOREOGRAPHED TO INTERSECT HERO AT KEY COMBAT BEATS
+    // 5 BANDIT SPLINES CHOREOGRAPHED FOR TIGHT COMBAT ALIGNMENT
     // ------------------------------------------------------------------
-    // WRAITH-1 (dies at t=37.0s by Sidewinder)
+    // WRAITH-1 (Act III Sidewinder kill at ~36.85s)
     const cW1 = new THREE.CatmullRomCurve3([
-      new THREE.Vector3(-180, 340, -1100),
-      new THREE.Vector3(-40, 130, -820),
-      new THREE.Vector3(140, 165, -1420),
-      new THREE.Vector3(-210, 280, -1820),
-      new THREE.Vector3(-300, 445, -1860),
-      new THREE.Vector3(-165, 525, -1420),
-      new THREE.Vector3(190, 560, -1210),
-      new THREE.Vector3(280, 520, -1550),
+      new THREE.Vector3(-180, 320, -1100),
+      new THREE.Vector3(-40, 125, -820),
+      new THREE.Vector3(135, 165, -1420),
+      new THREE.Vector3(-190, 275, -1860),
+      new THREE.Vector3(-340, 440, -1620),
+      new THREE.Vector3(-210, 520, -1160), // Ahead-port of Viper-1 at t=34–37s
+      new THREE.Vector3(140, 550, -1080),
+      new THREE.Vector3(260, 515, -1420),
     ]);
 
-    // WRAITH-2 (hero's Act II gun kill at t=24.5s — sweeps directly across Viper-1's nose!)
-    const cW2 = new THREE.CatmullRomCurve3([
-      new THREE.Vector3(190, 320, -1080),
-      new THREE.Vector3(80, 95, -780),
-      new THREE.Vector3(90, 135, -1240),
-      new THREE.Vector3(-115, 172, -1620),
-      new THREE.Vector3(62, 226, -2005), // Right in Viper-1's gunsight around t=22-25s
-      new THREE.Vector3(-40, 210, -2250),
-      new THREE.Vector3(-150, 90, -2500),
-    ]);
+    // WRAITH-2 (Act II Vulcan gun kill at t=24.5s — anchored directly ahead of Viper-1's gunsight!)
+    const w2Points: THREE.Vector3[] = [
+      new THREE.Vector3(175, 305, -1040),
+      new THREE.Vector3(85, 110, -760),
+    ];
+    const leadTimes = [11.0, 14.5, 17.5, 20.5, 22.5, 24.5, 27.0, 30.0];
+    const lateralWeave = [32, -26, 22, -11, 7, 0, -24, -48];
+    const vertOffset = [22, 12, 8, 3, 2, 1, -18, -55];
+    for (let i = 0; i < leadTimes.length; i++) {
+      const leadU = THREE.MathUtils.clamp((leadTimes[i] + 1.35) / TOTAL_DURATION, 0.01, 0.98);
+      const pt = this.heroCurve.getPointAt(leadU);
+      pt.x += lateralWeave[i];
+      pt.y += vertOffset[i];
+      w2Points.push(pt);
+    }
+    const cW2 = new THREE.CatmullRomCurve3(w2Points);
 
-    // WRAITH-3 (dies at t=47.5s via missile-nose cam!)
+    // WRAITH-3 (Act III featured Sidewinder missile-nose cam kill at ~47.48s)
     const cW3 = new THREE.CatmullRomCurve3([
-      new THREE.Vector3(0, 380, -1180),
-      new THREE.Vector3(-120, 180, -960),
-      new THREE.Vector3(20, 230, -1560),
-      new THREE.Vector3(-180, 390, -2060),
-      new THREE.Vector3(-140, 540, -1460),
-      new THREE.Vector3(270, 575, -1290),
-      new THREE.Vector3(410, 545, -1620),
-      new THREE.Vector3(190, 510, -1880),
+      new THREE.Vector3(0, 370, -1180),
+      new THREE.Vector3(-120, 185, -960),
+      new THREE.Vector3(25, 235, -1560),
+      new THREE.Vector3(-190, 390, -2020),
+      new THREE.Vector3(-120, 515, -1420),
+      new THREE.Vector3(280, 555, -1020),  // Wide crossing arc for ~3s Sidewinder flare slalom
+      new THREE.Vector3(520, 560, -1240),  // Target intercept zone at t=47.5s
+      new THREE.Vector3(410, 525, -1720),
     ]);
 
-    // WRAITH-4 (wingman to W3, dies at t=49.2s in twin cascading explosion!)
+    // WRAITH-4 (wingman to WRAITH-3, cascading twin detonation at ~49.15s)
     const cW4 = new THREE.CatmullRomCurve3([
-      new THREE.Vector3(90, 400, -1240),
-      new THREE.Vector3(150, 210, -980),
-      new THREE.Vector3(-70, 260, -1600),
-      new THREE.Vector3(-250, 420, -2000),
-      new THREE.Vector3(-90, 560, -1410),
-      new THREE.Vector3(315, 595, -1330),
-      new THREE.Vector3(440, 560, -1650),
-      new THREE.Vector3(225, 535, -1910),
+      new THREE.Vector3(85, 390, -1240),
+      new THREE.Vector3(145, 210, -980),
+      new THREE.Vector3(-65, 260, -1600),
+      new THREE.Vector3(-240, 415, -1980),
+      new THREE.Vector3(-60, 540, -1380),
+      new THREE.Vector3(345, 585, -960),
+      new THREE.Vector3(600, 585, -1210),
+      new THREE.Vector3(490, 545, -1740),
     ]);
 
-    // CRIMSON-1 ACE (boss duel in Act IV, annihilated by 6-missile supernova at t=69.5s!)
+    // CRIMSON-1 ACE (Act IV duel + wide horseshoe evasion into central monolith ring supernova at ~69.25s!)
     const cAce = new THREE.CatmullRomCurve3([
-      new THREE.Vector3(0, 460, -1280),
-      new THREE.Vector3(0, 260, -1020),
-      new THREE.Vector3(190, 290, -1620),
-      new THREE.Vector3(-60, 450, -2140),
-      new THREE.Vector3(-310, 575, -1660),
-      new THREE.Vector3(210, 610, -1240),
-      new THREE.Vector3(345, 555, -1720),
-      new THREE.Vector3(45, 525, -1880),
-      new THREE.Vector3(-170, 545, -1560),
-      new THREE.Vector3(55, 530, -1495), // Center of the obsidian ring for Act IV supernova!
-      new THREE.Vector3(220, 510, -1760),
-      new THREE.Vector3(140, 460, -2050),
+      new THREE.Vector3(0, 480, -400),
+      new THREE.Vector3(750, 380, -1350),
+      new THREE.Vector3(-550, 340, -2350),
+      new THREE.Vector3(-880, 460, -900),
+      new THREE.Vector3(480, 520, -450),
+      new THREE.Vector3(880, 590, -1650),
+      new THREE.Vector3(-250, 640, -2650),
+      new THREE.Vector3(-820, 610, -1300),
+      new THREE.Vector3(380, 580, -720),
+      new THREE.Vector3(760, 565, -1850),
+      new THREE.Vector3(-320, 575, -2420),
+      new THREE.Vector3(-260, 555, -1480),
+      new THREE.Vector3(310, 548, -1180),
+      new THREE.Vector3(210, 538, -1580),
+      new THREE.Vector3(-190, 535, -1480),
+      new THREE.Vector3(240, 555, -1820),  // Breaks outward-starboard at Macross launch (~64.0s)
+      new THREE.Vector3(440, 615, -2320),  // Stretches all 8 Macross prism ribbons across sky (~65.8s)
+      new THREE.Vector3(-80, 600, -2180),  // High-G horseshoe turn back toward cathedral (~67.5s)
+      new THREE.Vector3(0, 522, -1550),    // Dead-centre inside central obsidian monolith ring at t~69.25s!
+      new THREE.Vector3(260, 485, -1320),
     ]);
 
     this.banditCurves = [cW1, cW2, cW3, cW4, cAce];
+
+    // Pre-compute exact nominal kill anchors for paused scrubbing / supernova framing
+    this.sampleBanditAt(1, KILL_TIME_W2, this._w2KillPos, this._fwd);
+    this.sampleBanditAt(4, 69.25, this._supernovaFocus, this._fwd);
+
+    // Pre-allocate mutable camera director context (zero per-frame allocations)
+    this._camCtx = {
+      time: 0,
+      realTime: 0,
+      dt: 0.016,
+      mode: 'auto',
+      forceSnap: false,
+      isPlaying: false,
+      isPreLaunchIdle: true,
+      hero: this.hero,
+      bandits: this.bandits,
+      ace: this.ace,
+      featuredMissile: null,
+      supernovaFocus: this._supernovaFocus,
+      w2KillPos: this._w2KillPos,
+      cameraShake: 0,
+      speedIntensity: 0,
+      shockImpact: 0,
+    };
   }
 
   public reset(toTime = 0): void {
+    this.hasLaunchedOrReset = true;
     this.currentTime = THREE.MathUtils.clamp(toTime, 0, TOTAL_DURATION);
     this.triggeredEvents.clear();
     this.vfx.clearDynamic();
     this.featuredMissile = null;
     this.currentActIdx = -1;
     this.cameraShake = 0;
-    this.lastShotCutId = '';
+    this.gunTimer = 0;
+    this.sprayTimer = 0;
+    this.director.reset();
+
+    for (let i = 0; i < this.debrisTrails.length; i++) {
+      this.debrisTrails[i].active = false;
+    }
 
     for (const j of this.allJets) {
       j.alive = true;
       j.health = 1.0;
     }
 
-    // Mark past death/radio states when scrubbing forward
-    if (toTime > 25.0) this.bandits[1].alive = false;
-    if (toTime > 37.5) this.bandits[0].alive = false;
-    if (toTime > 48.0) this.bandits[2].alive = false;
-    if (toTime > 49.8) this.bandits[3].alive = false;
-    if (toTime > 70.0) this.ace.alive = false;
+    // Deterministic alive/dead states for scrubbing forward or backward
+    if (toTime > KILL_TIME_W2 + 0.05) this.bandits[1].alive = false;
+    if (toTime > KILL_TIME_W1 + 0.05) this.bandits[0].alive = false;
+    if (toTime > KILL_TIME_W3 + 0.05) this.bandits[2].alive = false;
+    if (toTime > KILL_TIME_W4 + 0.05) this.bandits[3].alive = false;
+    if (toTime > KILL_TIME_ACE + 0.05) this.ace.alive = false;
 
-    for (const cue of RADIO_CUES) {
-      if (cue.time < toTime - 0.5) this.triggeredEvents.add(`radio_${cue.id}`);
+    for (let i = 0; i < RADIO_CUES.length; i++) {
+      if (RADIO_CUES[i].time < toTime - 0.35) this.triggeredEvents.add(RADIO_EVENT_KEYS[i]);
     }
-    for (const evTime of [
-      ['flyby1', 6.5],
-      ['guns1', 21.5],
-      ['kill_w2', 24.5],
-      ['flares1', 27.5],
-      ['missile_w1', 34.0],
-      ['flares2', 41.5],
-      ['missile_w3', 44.5],
-      ['missile_w4', 46.2],
-      ['cobra_boom', 56.8],
-      ['macross_salvo', 63.5],
-      ['supernova_failback', 70.2],
-      ['finale_boom', 81.2],
-    ] as [string, number][]) {
-      if (evTime[1] < toTime) this.triggeredEvents.add(evTime[0]);
+    for (let i = 0; i < SCHEDULED_EVENTS.length; i++) {
+      const ev = SCHEDULED_EVENTS[i];
+      if (ev[1] < toTime) this.triggeredEvents.add(ev[0]);
     }
-  }
 
-  private fireOnce(key: string, fn: () => void): void {
-    if (this.triggeredEvents.has(key)) return;
-    this.triggeredEvents.add(key);
-    fn();
+    // Snap all jet world transforms immediately so scrubbed camera/VFX states are exact
+    this.updateAtmosphereAndTrip(this.currentTime);
+    this.updateJetPoses(this.currentTime, 0.016, this.currentTime, this.autoTripIntensity);
+    this.sampleBanditAt(1, KILL_TIME_W2, this._w2KillPos, this._fwd);
+    this.sampleBanditAt(4, 69.25, this._supernovaFocus, this._fwd);
+
+    // Seed signature paused-preview pyrotechnics when scrubbing directly into climax beats
+    if (toTime >= KILL_TIME_W2 - 0.05 && toTime <= 26.2) {
+      this.triggeredEvents.add('kill_w2');
+      this.bandits[1].alive = false;
+      this.bandits[1].updateVisuals(this.currentTime, this.autoTripIntensity);
+      this.vfx.spawnExplosion(this._w2KillPos, 58, false, this.autoTripIntensity);
+      this.env.triggerOceanShockwave(this._w2KillPos, 0.95);
+    } else if (toTime >= 44.5 && toTime <= 47.2 && this.bandits[2].alive) {
+      this.triggeredEvents.add('missile_w3');
+      this.triggeredEvents.add('flares2');
+      this.triggeredEvents.add('flares3');
+      this.vfx.popDecoyFlares(this.bandits[2], 12);
+      if (this.bandits[3].alive) this.vfx.popDecoyFlares(this.bandits[3], 10);
+      const frac = THREE.MathUtils.clamp((toTime - 44.5) / 2.9, 0.12, 0.72);
+      this._origin.copy(this.hero.group.position).lerp(this.bandits[2].group.position, frac);
+      this._initVel
+        .subVectors(this.bandits[2].group.position, this._origin)
+        .normalize()
+        .multiplyScalar(215);
+      this.featuredMissile = this.vfx.launchMissile(
+        'm_w3',
+        this._origin,
+        this._initVel,
+        this.bandits[2],
+        true,
+        215,
+        (hitPos) => this.killWraith3(hitPos, this.autoTripIntensity),
+      );
+    } else if (toTime >= KILL_TIME_ACE - 0.25 && toTime <= 72.4) {
+      this.triggeredEvents.add('macross_salvo');
+      this.triggeredEvents.add('kill_ace_fallback');
+      this.ace.alive = false;
+      this.ace.updateVisuals(this.currentTime, this.autoTripIntensity);
+      this.vfx.spawnExplosion(this._supernovaFocus, 118, true, Math.max(this.autoTripIntensity, 1.0));
+      this.env.triggerOceanShockwave(this._supernovaFocus, 1.95);
+    }
   }
 
   private sampleFlight(
@@ -311,53 +473,31 @@ export class DogfightChoreography {
     u: number,
     outPos: THREE.Vector3,
     outFwd: THREE.Vector3,
+    closed = false,
   ): number {
-    const cu = THREE.MathUtils.clamp(u, 0.001, 0.997);
+    const cu = closed ? ((u % 1) + 1) % 1 : THREE.MathUtils.clamp(u, 0.001, 0.997);
     curve.getPointAt(cu, outPos);
-    const tangent = curve.getTangentAt(cu);
-    outFwd.copy(tangent).normalize();
+    curve.getTangentAt(cu, this._tangent);
+    outFwd.copy(this._tangent).normalize();
 
-    // Compute banking angle from horizontal curve curvature
-    const nextT = curve.getTangentAt(Math.min(0.999, cu + 0.014));
-    const crossY = tangent.x * nextT.z - tangent.z * nextT.x;
+    const nextU = closed ? (cu + 0.014) % 1 : Math.min(0.999, cu + 0.014);
+    curve.getTangentAt(nextU, this._nextTangent);
+    const crossY = this._tangent.x * this._nextTangent.z - this._tangent.z * this._nextTangent.x;
     return THREE.MathUtils.clamp(crossY * 14.5, -1.25, 1.25);
   }
 
-  public update(
-    rawDt: number,
-    realTime: number,
-    camera: THREE.PerspectiveCamera,
-    camMode: CameraMode,
-    userTripOverride: number | null,
-    isPlaying: boolean,
-  ): { tripIntensity: number } {
-    // Compute slow-motion bullet-time curve at signature Bayhem hero beats!
-    let targetTimeScale = 1.0;
-    const t = this.currentTime;
-    if (t > 24.3 && t < 26.2) {
-      targetTimeScale = 0.36; // WRAITH-2 Vulcan shred slow-mo fireball!
-    } else if (t > 56.5 && t < 62.0) {
-      targetTimeScale = 0.28; // Inverted Pugachev's Cobra bullet-time orbit!
-    } else if (t > 69.3 && t < 72.4) {
-      targetTimeScale = 0.32; // Crimson-1 Supernova thermobaric detonation!
-    }
-    this.timeScale = THREE.MathUtils.lerp(this.timeScale, targetTimeScale, Math.min(1, rawDt * 6));
+  private sampleBanditAt(
+    idx: number,
+    t: number,
+    outPos: THREE.Vector3,
+    outFwd: THREE.Vector3,
+  ): number {
+    const bSpan = idx === 1 ? 30.5 : idx === 0 ? 45.5 : idx < 4 ? 58.0 : 72.0;
+    const bu = THREE.MathUtils.clamp((t + 1.5) / bSpan, 0, 0.995);
+    return this.sampleFlight(this.banditCurves[idx], bu, outPos, outFwd, false);
+  }
 
-    const simDt = isPlaying ? Math.min(rawDt, 0.05) * this.timeScale : 0;
-    if (isPlaying) {
-      this.currentTime = Math.min(TOTAL_DURATION, this.currentTime + rawDt);
-    }
-
-    // Check Act transitions
-    for (let i = 0; i < ACTS.length; i++) {
-      if (t >= ACTS[i].start && t < ACTS[i].end && i !== this.currentActIdx) {
-        this.currentActIdx = i;
-        this.callbacks.onActChange(ACTS[i]);
-      }
-    }
-
-    // Atmosphere & LSD escalation curve
-    // Grounded golden hour (0-24s) -> Storm climb (24-42s) -> Full Acid Supercell (42-73s) -> Golden sunrise aftermath (73-88s)
+  private updateAtmosphereAndTrip(t: number): void {
     if (t < 24) {
       this.stormIntensity = THREE.MathUtils.smoothstep(t, 12, 24) * 0.22;
       this.autoTripIntensity = THREE.MathUtils.smoothstep(t, 16, 24) * 0.14;
@@ -371,276 +511,559 @@ export class DogfightChoreography {
       this.stormIntensity = THREE.MathUtils.lerp(0.95, 0.12, THREE.MathUtils.smoothstep(t, 73, 84));
       this.autoTripIntensity = THREE.MathUtils.lerp(1.15, 0.18, THREE.MathUtils.smoothstep(t, 73, 84));
     }
+  }
 
-    const tripIntensity = userTripOverride !== null ? userTripOverride : this.autoTripIntensity;
-
-    // ------------------------------------------------------------------
-    // 1. UPDATE HERO & BANDIT POSES
-    // ------------------------------------------------------------------
+  private updateJetPoses(t: number, motionDt: number, realTime: number, tripIntensity: number): void {
     const uHero = THREE.MathUtils.clamp(t / TOTAL_DURATION, 0, 1);
     const pos = this._pos;
     const fwd = this._fwd;
-    let heroBank = this.sampleFlight(this.heroCurve, uHero, pos, fwd);
+    let heroBank = this.sampleFlight(this.heroCurve, uHero, pos, fwd, false);
 
-    // Extra dramatic hero stunts: barrel roll in Act I, Cobra pitch-up in Act IV, victory roll in Act V
+    // Signature hero stunts: monotonic Act I barrel roll, Act IV inverted Cobra, Act V victory roll
     let extraPitch = 0;
-    if (t > 8.0 && t < 11.2) {
-      const p = (t - 8.0) / 3.2;
-      heroBank += Math.sin(p * Math.PI) * Math.PI * 2;
-    } else if (t > 56.2 && t < 62.5) {
+    if (t > 9.4 && t < 12.6) {
+      const p = (t - 9.4) / 3.2;
+      heroBank += THREE.MathUtils.smoothstep(p, 0, 1) * Math.PI * 2;
+    } else if (t > 56.2 && t < 63.0) {
       // Inverted Pugachev's Cobra!
-      const p = (t - 56.2) / 6.3;
+      const p = (t - 56.2) / 6.8;
       const bell = Math.sin(p * Math.PI);
       heroBank += Math.PI * bell;
-      extraPitch = bell * 0.88;
-    } else if (t > 77.0 && t < 80.5) {
-      const p = (t - 77.0) / 3.5;
+      extraPitch = bell * 0.92;
+    } else if (t > 76.8 && t < 80.3) {
+      const p = (t - 76.8) / 3.5;
       heroBank += p * Math.PI * 2;
     }
 
-    this.hero.throttle = t < 5 ? 0.85 + t * 0.1 : t > 79 ? 1.45 : 1.15 + Math.sin(t * 1.4) * 0.15;
-    // Supersonic vapor cone flashes at Mach break (t=6-9s), climb (31-35s), Cobra (56-59s), vertical punch (81-86s)
+    this.hero.throttle =
+      t < 5.0 ? 0.92 + t * 0.08 : t > 79.5 ? 1.48 : 1.18 + Math.sin(t * 1.45) * 0.15;
+
+    // Supersonic Prandtl-Glauert vapour cone flashes on Mach break, storm climb, Cobra, vertical punch
     const vaporPulse =
-      Math.exp(-Math.pow((t - 7.0) / 1.4, 2)) +
-      Math.exp(-Math.pow((t - 32.5) / 1.8, 2)) * 0.9 +
-      Math.exp(-Math.pow((t - 57.2) / 1.6, 2)) * 1.0 +
+      Math.exp(-Math.pow((t - 6.8) / 1.35, 2)) +
+      Math.exp(-Math.pow((t - 32.5) / 1.7, 2)) * 0.92 +
+      Math.exp(-Math.pow((t - 57.4) / 1.6, 2)) * 1.0 +
       Math.exp(-Math.pow((t - 82.0) / 2.2, 2)) * 1.0;
     this.hero.vaporIntensity = THREE.MathUtils.clamp(vaporPulse, 0, 1);
     this.speedIntensity = THREE.MathUtils.clamp(
-      (this.hero.throttle - 0.75) * 0.85 + vaporPulse * 0.55,
+      (this.hero.throttle - 0.72) * 0.85 + vaporPulse * 0.55,
       0,
       1.2,
     );
 
-    this.hero.setPoseFromMotion(pos, fwd, heroBank, Math.max(simDt, 0.016), extraPitch);
+    this.hero.setPoseFromMotion(pos, fwd, heroBank, Math.max(motionDt, 0.016), extraPitch);
     this.hero.updateVisuals(realTime, tripIntensity);
 
-    // Update Bandits along their splines
+    // Update all 5 bandits along their choreographed intercept splines
     for (let i = 0; i < this.bandits.length; i++) {
       const b = this.bandits[i];
       if (!b.alive) {
         b.updateVisuals(realTime, tripIntensity);
         continue;
       }
-      const bSpan = i === 1 ? 30 : i === 0 ? 45 : i < 4 ? 58 : 82;
-      const bu = THREE.MathUtils.clamp((t + 1.5) / bSpan, 0, 0.995);
-      const bBank = this.sampleFlight(this.banditCurves[i], bu, pos, fwd);
-      b.throttle = i === 4 ? 1.3 : 1.05;
-      b.vaporIntensity = i === 4 && t > 52 && t < 68 ? 0.45 : 0;
-      b.setPoseFromMotion(pos, fwd, bBank, Math.max(simDt, 0.016));
+      const bBank = this.sampleBanditAt(i, t, pos, fwd);
+      b.throttle = i === 4 ? 1.35 : 1.08;
+      b.vaporIntensity = i === 4 && t > 52 && t < 68 ? 0.48 : 0;
+      b.setPoseFromMotion(pos, fwd, bBank, Math.max(motionDt, 0.016));
       b.updateVisuals(realTime, tripIntensity);
+    }
+  }
+
+  private updatePreLaunchIdle(rawDt: number, realTime: number, tripIntensity: number): void {
+    const safeDt = Math.max(rawDt, 0.016);
+    const uLoop = (realTime * 0.022) % 1;
+    const bank = this.sampleFlight(this.idleHeroCurve, uLoop, this._pos, this._fwd, true);
+
+    this.hero.alive = true;
+    this.hero.throttle = 1.18 + Math.sin(realTime * 1.2) * 0.12;
+    this.hero.vaporIntensity = 0.25 * Math.max(0, Math.sin(realTime * 0.75));
+    this.speedIntensity = 0.42;
+    this.hero.setPoseFromMotion(this._pos, this._fwd, bank, safeDt, 0);
+    this.hero.updateVisuals(realTime, tripIntensity);
+
+    // Distant bandits cruising high above the golden ocean canyon during idle preview
+    for (let i = 0; i < this.bandits.length; i++) {
+      const b = this.bandits[i];
+      const angle = realTime * 0.12 + i * 1.25;
+      const rad = 340 + i * 55;
+      this._pos.set(Math.cos(angle) * rad, 220 + i * 32, -720 + Math.sin(angle) * rad);
+      this._fwd.set(-Math.sin(angle), 0, Math.cos(angle)).normalize();
+      b.alive = true;
+      b.throttle = 1.0;
+      b.vaporIntensity = 0;
+      b.setPoseFromMotion(this._pos, this._fwd, 0.35, safeDt);
+      b.updateVisuals(realTime, tripIntensity);
+    }
+
+    this.emitSeaSprayWake(safeDt);
+  }
+
+  private emitSeaSprayWake(dt: number): void {
+    const heroPos = this.hero.group.position;
+    if (heroPos.y >= 46 || dt <= 0) return;
+
+    this.sprayTimer += dt;
+    if (this.sprayTimer < 0.032) return;
+    this.sprayTimer = 0;
+
+    const altFactor = THREE.MathUtils.clamp(1 - (heroPos.y - 18) / 28, 0.18, 1.0);
+    const hv = this.hero.velocity;
+    for (let s = -1; s <= 1; s += 2) {
+      this.vfx.particles.emitPuff(
+        heroPos.x + s * (5.5 + Math.random() * 4.5),
+        2.6 + Math.random() * 2.5,
+        heroPos.z + (Math.random() - 0.5) * 8.0,
+        hv.x * 0.12 + s * (16 + Math.random() * 14),
+        10 + Math.random() * 12 * altFactor,
+        hv.z * 0.12 + (Math.random() - 0.5) * 10,
+        2.8,
+        13.5 * altFactor,
+        0.95 + Math.random() * 0.45,
+        0.0,
+        0.0,
+        0.98,
+        0.88,
+        0.74,
+        0.34 * altFactor,
+        1.7,
+        4.0,
+        (Math.random() - 0.5) * 1.6,
+        0,
+      );
+    }
+  }
+
+  private spawnDebrisTrail(
+    slotIndex: number,
+    origin: THREE.Vector3,
+    velocity: THREE.Vector3,
+    prism: boolean,
+  ): void {
+    const slot = this.debrisTrails[slotIndex % this.debrisTrails.length];
+    slot.active = true;
+    slot.pos.copy(origin);
+    slot.vel.copy(velocity);
+    if (slot.vel.lengthSq() < 1600) {
+      slot.vel.set(0, -18, -110);
+    }
+    slot.vel.multiplyScalar(0.62);
+    slot.vel.y -= 16;
+    slot.age = 0;
+    slot.duration = 3.6;
+    slot.emitAccum = 0;
+    slot.splashed = false;
+    slot.prism = prism;
+  }
+
+  private updateDebrisTrails(simDt: number): void {
+    if (simDt <= 0) return;
+
+    for (let i = 0; i < this.debrisTrails.length; i++) {
+      const d = this.debrisTrails[i];
+      if (!d.active) continue;
+
+      d.age += simDt;
+      if (d.age >= d.duration) {
+        d.active = false;
+        continue;
+      }
+
+      // Ballistic tumbling wreckage descent under gravity
+      d.vel.y -= 48 * simDt;
+      d.vel.multiplyScalar(Math.max(0, 1 - 0.22 * simDt));
+      d.pos.addScaledVector(d.vel, simDt);
+
+      if (!d.splashed && d.pos.y <= 10) {
+        d.splashed = true;
+        d.pos.y = 10;
+        this.env.triggerOceanShockwave(d.pos, 0.72);
+        d.active = false;
+        continue;
+      }
+
+      d.emitAccum += simDt;
+      if (d.emitAccum >= 0.036) {
+        d.emitAccum = 0;
+        const fade = 1 - d.age / d.duration;
+
+        // Thick soot-and-ember smoke ribbon behind falling wreckage
+        this.vfx.particles.emitPuff(
+          d.pos.x + (Math.random() - 0.5) * 4,
+          d.pos.y + (Math.random() - 0.5) * 4,
+          d.pos.z + (Math.random() - 0.5) * 4,
+          -d.vel.x * 0.08 + (Math.random() - 0.5) * 10,
+          8 + Math.random() * 10,
+          -d.vel.z * 0.08 + (Math.random() - 0.5) * 10,
+          3.4,
+          16.5,
+          1.45 + Math.random() * 0.65,
+          0.95 * fade,
+          0.0,
+          0.12,
+          0.10,
+          0.11,
+          0.74 * fade,
+          1.35,
+          7.0,
+          (Math.random() - 0.5) * 2.2,
+          d.prism ? 1 : 0,
+        );
+
+        // Trailing molten wreckage sparks
+        for (let k = 0; k < 3; k++) {
+          this.vfx.particles.emitSpark(
+            d.pos.x,
+            d.pos.y,
+            d.pos.z,
+            -d.vel.x * 0.25 + (Math.random() - 0.5) * 42,
+            -d.vel.y * 0.15 + (Math.random() - 0.5) * 32,
+            -d.vel.z * 0.25 + (Math.random() - 0.5) * 42,
+            0.95,
+            0.55 + Math.random() * 0.35,
+            1.0,
+            d.prism ? 0.45 : 0.65,
+            d.prism ? 0.95 : 0.18,
+            1.5,
+            0.7,
+            26.0,
+          );
+        }
+      }
+    }
+  }
+
+  private killWraith2(tripIntensity: number): void {
+    const w2 = this.bandits[1];
+    if (!w2.alive) return;
+    this._w2KillPos.copy(w2.group.position);
+    w2.alive = false;
+    this.vfx.spawnExplosion(this._w2KillPos, 58, false, tripIntensity);
+    this.spawnDebrisTrail(1, this._w2KillPos, w2.velocity, false);
+    this.env.triggerOceanShockwave(this._w2KillPos, 0.95);
+    this.callbacks.onSfx('sfx_explosion', 1.0, -0.1);
+    this.cameraShake = Math.max(this.cameraShake, 1.3);
+  }
+
+  private killWraith1(hitPos: THREE.Vector3, tripIntensity: number): void {
+    const w1 = this.bandits[0];
+    if (!w1.alive) return;
+    w1.alive = false;
+    this.vfx.spawnExplosion(hitPos, 60, false, tripIntensity);
+    this.spawnDebrisTrail(0, hitPos, w1.velocity, tripIntensity > 0.3);
+    this.env.triggerOceanShockwave(hitPos, 0.85);
+    this.callbacks.onSfx('sfx_explosion', 0.96, -0.25);
+    this.cameraShake = Math.max(this.cameraShake, 1.2);
+  }
+
+  private killWraith3(hitPos: THREE.Vector3, tripIntensity: number): void {
+    const w3 = this.bandits[2];
+    if (!w3.alive) return;
+    w3.alive = false;
+    this.featuredMissile = null;
+    this.vfx.spawnExplosion(hitPos, 66, false, tripIntensity);
+    this.spawnDebrisTrail(2, hitPos, w3.velocity, true);
+    this.env.triggerOceanShockwave(hitPos, 0.9);
+    this.callbacks.onSfx('sfx_explosion', 1.0, 0.15);
+    this.cameraShake = Math.max(this.cameraShake, 1.35);
+  }
+
+  private killWraith4(hitPos: THREE.Vector3, tripIntensity: number): void {
+    const w4 = this.bandits[3];
+    if (!w4.alive) return;
+    w4.alive = false;
+    this.vfx.spawnExplosion(hitPos, 72, false, tripIntensity);
+    this.spawnDebrisTrail(3, hitPos, w4.velocity, true);
+    this.env.triggerOceanShockwave(hitPos, 1.0);
+    this.callbacks.onSfx('sfx_explosion', 0.98, -0.15);
+    this.cameraShake = Math.max(this.cameraShake, 1.35);
+  }
+
+  private killAce(hitPos: THREE.Vector3, tripIntensity: number): void {
+    if (!this.ace.alive) return;
+    this.ace.alive = false;
+    this.featuredMissile = null;
+    this._supernovaFocus.copy(hitPos);
+
+    // Colossal thermobaric supernova sky detonation + twin cascading shock blasts
+    this.vfx.spawnExplosion(hitPos, 165, true, Math.max(tripIntensity, 1.0));
+    this._secPos.set(hitPos.x + 28, hitPos.y + 18, hitPos.z - 18);
+    this.vfx.spawnExplosion(this._secPos, 92, false, 1.0);
+    this._secPos.set(hitPos.x - 32, hitPos.y - 14, hitPos.z + 22);
+    this.vfx.spawnExplosion(this._secPos, 86, false, 1.0);
+
+    this.spawnDebrisTrail(4, hitPos, this.ace.velocity, true);
+    this.env.triggerOceanShockwave(hitPos, 1.95);
+    this.callbacks.onSfx('sfx_supernova', 1.0, 0);
+    this.cameraShake = 2.2;
+  }
+
+  public update(
+    rawDt: number,
+    realTime: number,
+    camera: THREE.PerspectiveCamera,
+    camMode: CameraMode,
+    userTripOverride: number | null,
+    isPlaying: boolean,
+  ): { tripIntensity: number } {
+    if (isPlaying) {
+      this.hasLaunchedOrReset = true;
+    }
+    this.lastIsPlaying = isPlaying;
+
+    const isPreLaunchIdle = !this.hasLaunchedOrReset && !isPlaying && camMode === 'cinematic';
+    if (isPreLaunchIdle) {
+      const tripIntensity = userTripOverride !== null ? userTripOverride : 0.12;
+      this.stormIntensity = 0.08;
+      this.autoTripIntensity = 0.12;
+      this.timeScale = 1.0;
+      this.updatePreLaunchIdle(rawDt, realTime, tripIntensity);
+      this.updateCameraInternal(rawDt, realTime, camera, camMode, false, false, true);
+      this._updateResult.tripIntensity = tripIntensity;
+      return this._updateResult;
+    }
+
+    // Slow-motion bullet-time curve at signature Michael Bay hero beats
+    const t = this.currentTime;
+    let targetTimeScale = 1.0;
+    if (t > 24.3 && t < 26.5) {
+      targetTimeScale = 0.34; // WRAITH-2 slow-mo wing-shear fireball pass
+    } else if (t > 56.4 && t < 62.6) {
+      targetTimeScale = 0.28; // Inverted Pugachev's Cobra 360° bullet-time orbit
+    } else if (t > 69.3 && t < 72.6) {
+      targetTimeScale = 0.30; // CRIMSON-1 Ace thermobaric supernova blast
+    }
+    this.timeScale = THREE.MathUtils.lerp(this.timeScale, targetTimeScale, Math.min(1, rawDt * 6));
+
+    const simDt = isPlaying ? Math.min(rawDt, 0.05) * this.timeScale : 0;
+    if (isPlaying) {
+      this.currentTime = Math.min(TOTAL_DURATION, this.currentTime + rawDt);
+    }
+
+    // Act banner transitions
+    for (let i = 0; i < ACTS.length; i++) {
+      if (t >= ACTS[i].start && t < ACTS[i].end && i !== this.currentActIdx) {
+        this.currentActIdx = i;
+        this.callbacks.onActChange(ACTS[i]);
+      }
+    }
+
+    // Atmosphere & LSD escalation curve
+    this.updateAtmosphereAndTrip(t);
+    const tripIntensity = userTripOverride !== null ? userTripOverride : this.autoTripIntensity;
+
+    // ------------------------------------------------------------------
+    // 1. UPDATE HERO & BANDIT POSES + LOW-ALTITUDE SEA-SPRAY WAKE
+    // ------------------------------------------------------------------
+    this.updateJetPoses(t, simDt, realTime, tripIntensity);
+    if (isPlaying) {
+      this.emitSeaSprayWake(simDt);
+      this.updateDebrisTrails(simDt);
     }
 
     // ------------------------------------------------------------------
     // 2. TRIGGER CHOREOGRAPHED RADIO, COMBAT, MISSILE & EXPLOSION BEATS
+    //    (Zero per-frame closures or template-string allocations)
     // ------------------------------------------------------------------
     if (isPlaying) {
-      // Radio callouts
-      for (const cue of RADIO_CUES) {
-        if (t >= cue.time) {
-          this.fireOnce(`radio_${cue.id}`, () => this.callbacks.onRadio(cue));
+      for (let i = 0; i < RADIO_CUES.length; i++) {
+        const cue = RADIO_CUES[i];
+        const radioKey = RADIO_EVENT_KEYS[i];
+        if (t >= cue.time && !this.triggeredEvents.has(radioKey)) {
+          this.triggeredEvents.add(radioKey);
+          this.callbacks.onRadio(cue);
         }
       }
 
-      // Act I supersonic flyby + Mach boom
-      if (t >= 6.5) {
-        this.fireOnce('flyby1', () => {
-          this.callbacks.onSfx('sfx_flyby', 0.95, 0.15);
-          this.cameraShake = Math.max(this.cameraShake, 0.65);
-          this.env.triggerOceanShockwave(this.hero.group.position, 0.65);
-        });
+      // Act I: Supersonic Mach 1 break & sea-stack near-miss ocean shockwave
+      if (t >= 6.5 && !this.triggeredEvents.has('flyby1')) {
+        this.triggeredEvents.add('flyby1');
+        this.callbacks.onSfx('sfx_flyby', 0.95, 0.15);
+        this.cameraShake = Math.max(this.cameraShake, 0.72);
+        this.env.triggerOceanShockwave(this.hero.group.position, 0.75);
       }
 
-      // Act II: Vulcan rotary cannon burst tearing into WRAITH-2 (t=21.5–24.5s)
-      if (t >= 21.5 && t <= 24.4 && this.bandits[1].alive) {
-        this.fireOnce('guns1', () => this.callbacks.onSfx('sfx_vulcan', 0.92, 0));
+      // Act II: 20mm Vulcan rotary cannon burst ripping into WRAITH-2 (t=20.8–24.45s)
+      if (t >= 20.8 && t <= 24.45 && this.bandits[1].alive) {
+        if (!this.triggeredEvents.has('guns1')) {
+          this.triggeredEvents.add('guns1');
+          this.callbacks.onSfx('sfx_vulcan', 0.94, 0);
+        }
         this.gunTimer += rawDt;
-        if (this.gunTimer > 0.065) {
+        if (this.gunTimer > 0.062) {
           this.gunTimer = 0;
-          const aim = this.bandits[1].group.position.clone().sub(this.hero.group.position);
-          this.vfx.fireVulcanBurst(this.hero, aim, 3);
-          this.cameraShake = Math.max(this.cameraShake, 0.35);
+          this._aim.subVectors(this.bandits[1].group.position, this.hero.group.position);
+          this.vfx.fireVulcanBurst(this.hero, this._aim, 3);
+          this.cameraShake = Math.max(this.cameraShake, 0.36);
         }
       }
 
-      // Kill WRAITH-2 in blazing slow-mo fireball!
-      if (t >= 24.5) {
-        this.fireOnce('kill_w2', () => {
-          const w2 = this.bandits[1];
-          const p = w2.group.position.clone();
-          w2.alive = false;
-          this.vfx.spawnExplosion(p, 52, false, tripIntensity);
-          this.env.triggerOceanShockwave(p, 0.85);
-          this.callbacks.onSfx('sfx_explosion', 1.0, -0.1);
-          this.cameraShake = Math.max(this.cameraShake, 1.25);
+      // Kill #1: WRAITH-2 wing-shear fireball in slow-mo!
+      if (t >= KILL_TIME_W2 && !this.triggeredEvents.has('kill_w2')) {
+        this.triggeredEvents.add('kill_w2');
+        this.killWraith2(tripIntensity);
+      }
+
+      // VIPER-1 pops golden decoy flare blossom banking clear of fireball
+      if (t >= 27.4 && !this.triggeredEvents.has('flares1')) {
+        this.triggeredEvents.add('flares1');
+        this.vfx.popDecoyFlares(this.hero, 14);
+        this.callbacks.onSfx('sfx_flares', 0.88, 0.1);
+      }
+
+      // Act III: Sidewinder launch (~3.05s flight -> impacts WRAITH-1 at ~36.85s)
+      if (t >= 33.8 && !this.triggeredEvents.has('missile_w1')) {
+        this.triggeredEvents.add('missile_w1');
+        this._offset.set(-4.5, -1.0, 0).applyQuaternion(this.hero.group.quaternion);
+        this._origin.copy(this.hero.group.position).add(this._offset);
+        this._initVel.copy(this.hero.velocity);
+        if (this._initVel.lengthSq() < 1) {
+          this._initVel.set(0, 0, -1).applyQuaternion(this.hero.group.quaternion);
+        } else {
+          this._initVel.normalize();
+        }
+        this._initVel.multiplyScalar(290);
+        this.callbacks.onSfx('sfx_missile', 0.92, -0.2);
+        this.vfx.launchMissile('m_w1', this._origin, this._initVel, this.bandits[0], true, 375, (hitPos) => {
+          this.killWraith1(hitPos, tripIntensity);
+        });
+      }
+      if (t >= KILL_TIME_W1 && this.bandits[0].alive && !this.triggeredEvents.has('kill_w1_fallback')) {
+        this.triggeredEvents.add('kill_w1_fallback');
+        this.killWraith1(this.bandits[0].group.position, tripIntensity);
+      }
+
+      // Supercell decoy flare curtains popped by WRAITH-3 & WRAITH-4
+      if (t >= 41.5 && !this.triggeredEvents.has('flares2')) {
+        this.triggeredEvents.add('flares2');
+        if (this.bandits[2].alive) this.vfx.popDecoyFlares(this.bandits[2], 12);
+        if (this.bandits[3].alive) this.vfx.popDecoyFlares(this.bandits[3], 12);
+        this.callbacks.onSfx('sfx_flares', 0.84, 0.25);
+      }
+
+      // Act III: Featured Sidewinder Missile-Nose Cam (~3.0s slalom through flares -> Kill #3 at ~47.48s)
+      if (t >= 44.5 && !this.triggeredEvents.has('missile_w3')) {
+        this.triggeredEvents.add('missile_w3');
+        this._offset.set(5.0, -1.0, 0).applyQuaternion(this.hero.group.quaternion);
+        this._origin.copy(this.hero.group.position).add(this._offset);
+        this._initVel.copy(this.hero.velocity);
+        if (this._initVel.lengthSq() < 1) {
+          this._initVel.set(0, 0, -1).applyQuaternion(this.hero.group.quaternion);
+        } else {
+          this._initVel.normalize();
+        }
+        this._initVel.multiplyScalar(190);
+        this.callbacks.onSfx('sfx_missile', 0.95, 0.2);
+        this.featuredMissile = this.vfx.launchMissile(
+          'm_w3',
+          this._origin,
+          this._initVel,
+          this.bandits[2],
+          true,
+          215,
+          (hitPos) => this.killWraith3(hitPos, tripIntensity),
+        );
+      }
+
+      // Second mid-slalom flare burst right in front of the Sidewinder nose cam
+      if (t >= 44.8 && !this.triggeredEvents.has('flares3')) {
+        this.triggeredEvents.add('flares3');
+        if (this.bandits[2].alive) this.vfx.popDecoyFlares(this.bandits[2], 10);
+        this.callbacks.onSfx('sfx_flares', 0.78, 0.15);
+      }
+
+      // Second curving prism Sidewinder (~2.95s flight -> Kill #4 WRAITH-4 twin detonation at ~49.15s)
+      if (t >= 46.2 && !this.triggeredEvents.has('missile_w4')) {
+        this.triggeredEvents.add('missile_w4');
+        this._offset.set(-5.0, -1.0, 0).applyQuaternion(this.hero.group.quaternion);
+        this._origin.copy(this.hero.group.position).add(this._offset);
+        this._initVel.copy(this.hero.velocity);
+        if (this._initVel.lengthSq() < 1) {
+          this._initVel.set(0, 0, -1).applyQuaternion(this.hero.group.quaternion);
+        } else {
+          this._initVel.normalize();
+        }
+        this._initVel.multiplyScalar(190);
+        this.callbacks.onSfx('sfx_missile', 0.88, -0.2);
+        this.vfx.launchMissile('m_w4', this._origin, this._initVel, this.bandits[3], true, 210, (hitPos) => {
+          this.killWraith4(hitPos, tripIntensity);
         });
       }
 
-      // Hero pops golden decoy flare blossom dodging enemy tracers
-      if (t >= 27.5) {
-        this.fireOnce('flares1', () => {
-          this.vfx.popDecoyFlares(this.hero, 14);
-          this.callbacks.onSfx('sfx_flares', 0.88, 0.1);
-        });
+      if (t >= KILL_TIME_W3 && this.bandits[2].alive && !this.triggeredEvents.has('kill_w3_fallback')) {
+        this.triggeredEvents.add('kill_w3_fallback');
+        this.killWraith3(this.bandits[2].group.position, tripIntensity);
+      }
+      if (t >= KILL_TIME_W4 && this.bandits[3].alive && !this.triggeredEvents.has('kill_w4_fallback')) {
+        this.triggeredEvents.add('kill_w4_fallback');
+        this.killWraith4(this.bandits[3].group.position, tripIntensity);
       }
 
-      // Act III: Sidewinder kill on WRAITH-1
-      if (t >= 34.0) {
-        this.fireOnce('missile_w1', () => {
-          const origin = this.hero.group.position.clone().add(new THREE.Vector3(-4, -1, 0));
-          const initVel = this.hero.velocity.clone().normalize().multiplyScalar(320);
-          this.callbacks.onSfx('sfx_missile', 0.92, -0.2);
-          this.vfx.launchMissile('m_w1', origin, initVel, this.bandits[0], true, 480, (hitPos) => {
-            this.bandits[0].alive = false;
-            this.vfx.spawnExplosion(hitPos, 56, false, tripIntensity);
-            this.env.triggerOceanShockwave(hitPos, 0.8);
-            this.callbacks.onSfx('sfx_explosion', 0.95, -0.25);
-            this.cameraShake = Math.max(this.cameraShake, 1.15);
-          });
-        });
+      // Act IV: CRIMSON-1 Ace head-on Vulcan tracer stream
+      if (t >= 52.2 && t <= 56.0 && this.ace.alive) {
+        this.gunTimer += rawDt;
+        if (this.gunTimer > 0.105) {
+          this.gunTimer = 0;
+          this._aim.subVectors(this.hero.group.position, this.ace.group.position);
+          this._aim.x += 13;
+          this._aim.y += 5;
+          this.vfx.fireVulcanBurst(this.ace, this._aim, 2);
+        }
       }
 
-      // Supercell decoy flares from WRAITH-3/4
-      if (t >= 41.5) {
-        this.fireOnce('flares2', () => {
-          if (this.bandits[2].alive) this.vfx.popDecoyFlares(this.bandits[2], 12);
-          if (this.bandits[3].alive) this.vfx.popDecoyFlares(this.bandits[3], 12);
-          this.callbacks.onSfx('sfx_flares', 0.82, 0.3);
-        });
+      // Inverted Pugachev's Cobra sonic boom + golden decoy flare blossom
+      if (t >= 56.8 && !this.triggeredEvents.has('cobra_boom')) {
+        this.triggeredEvents.add('cobra_boom');
+        this.vfx.popDecoyFlares(this.hero, 18);
+        this.callbacks.onSfx('sfx_flyby', 0.92, 0);
+        this.callbacks.onSfx('sfx_flares', 0.9, 0);
+        this.cameraShake = Math.max(this.cameraShake, 0.88);
       }
 
-      // Missile-Nose Chase Cam! Launch featured Sidewinder at WRAITH-3
-      if (t >= 44.5) {
-        this.fireOnce('missile_w3', () => {
-          const origin = this.hero.group.position.clone().add(new THREE.Vector3(5, -1, 0));
-          const initVel = this.hero.velocity.clone().normalize().multiplyScalar(280);
-          this.callbacks.onSfx('sfx_missile', 0.95, 0.2);
-          this.featuredMissile = this.vfx.launchMissile(
-            'm_w3',
-            origin,
-            initVel,
-            this.bandits[2],
+      // 8-MISSILE MACROSS PRISM-TRAIL SALVO AT CRIMSON-1 ACE!
+      // Leader (k=3) is fastest so Shot 12 tracks it cleanly across 65.5–69.2s into the monolith ring supernova
+      if (t >= 64.0 && !this.triggeredEvents.has('macross_salvo')) {
+        this.triggeredEvents.add('macross_salvo');
+        this.callbacks.onSfx('sfx_missile', 1.0, 0);
+        const heroQ = this.hero.group.quaternion;
+        const heroPos = this.hero.group.position;
+        for (let k = 0; k < 8; k++) {
+          const norm = (k - 3.5) / 3.5;
+          const fanAngle = norm * 1.15;
+          this._offset.set(norm * 7.8, -1.1 + (k % 2 === 0 ? 0.45 : -0.35), 0).applyQuaternion(heroQ);
+          this._origin.copy(heroPos).add(this._offset);
+
+          this._launchDir
+            .set(Math.sin(fanAngle) * 0.72, Math.cos(k * 1.35) * 0.34 + 0.12, -1.0)
+            .applyQuaternion(heroQ)
+            .normalize()
+            .multiplyScalar(230);
+
+          const cruiseSpeed = 311 - Math.abs(k - 3) * 3;
+          const m = this.vfx.launchMissile(
+            MACROSS_MISSILE_IDS[k],
+            this._origin,
+            this._launchDir,
+            this.ace,
             true,
-            430,
-            (hitPos) => {
-              this.bandits[2].alive = false;
-              this.featuredMissile = null;
-              this.vfx.spawnExplosion(hitPos, 64, false, tripIntensity);
-              this.callbacks.onSfx('sfx_explosion', 1.0, 0.15);
-              this.cameraShake = Math.max(this.cameraShake, 1.3);
-            },
+            cruiseSpeed,
+            (hitPos) => this.killAce(hitPos, tripIntensity),
           );
-        });
-      }
-
-      // Second curving prism missile obliterates WRAITH-4 right behind W3!
-      if (t >= 46.2) {
-        this.fireOnce('missile_w4', () => {
-          const origin = this.hero.group.position.clone().add(new THREE.Vector3(-5, -1, 0));
-          const initVel = this.hero.velocity.clone().normalize().multiplyScalar(290);
-          this.callbacks.onSfx('sfx_missile', 0.85, -0.2);
-          this.vfx.launchMissile('m_w4', origin, initVel, this.bandits[3], true, 460, (hitPos) => {
-            this.bandits[3].alive = false;
-            this.vfx.spawnExplosion(hitPos, 68, false, tripIntensity);
-            this.env.triggerOceanShockwave(hitPos, 0.95);
-            this.callbacks.onSfx('sfx_explosion', 0.98, -0.15);
-            this.cameraShake = Math.max(this.cameraShake, 1.3);
-          });
-        });
-      }
-
-      // Act IV: Inverted Pugachev's Cobra sonic boom + golden flares
-      if (t >= 56.8) {
-        this.fireOnce('cobra_boom', () => {
-          this.vfx.popDecoyFlares(this.hero, 18);
-          this.callbacks.onSfx('sfx_flyby', 0.9, 0);
-          this.callbacks.onSfx('sfx_flares', 0.88, 0);
-          this.cameraShake = Math.max(this.cameraShake, 0.85);
-        });
-      }
-
-      // Enemy Ace return-fire tracer stream during Act IV duel
-      if (t >= 52.5 && t <= 56.0 && this.ace.alive) {
-        this.gunTimer += rawDt;
-        if (this.gunTimer > 0.11) {
-          this.gunTimer = 0;
-          const aim = this.hero.group.position
-            .clone()
-            .sub(this.ace.group.position)
-            .add(new THREE.Vector3(14, 6, 0));
-          this.vfx.fireVulcanBurst(this.ace, aim, 2);
+          if (k === 3) this.featuredMissile = m;
         }
       }
 
-      // 6-MISSILE MACROSS PRISM-TRAIL SALVO AT CRIMSON-1 ACE!
-      if (t >= 63.5) {
-        this.fireOnce('macross_salvo', () => {
-          this.callbacks.onSfx('sfx_missile', 1.0, 0);
-          for (let k = 0; k < 6; k++) {
-            const fanAngle = ((k - 2.5) / 2.5) * 0.95;
-            const offset = new THREE.Vector3((k - 2.5) * 2.8, -1.2, 0).applyQuaternion(
-              this.hero.group.quaternion,
-            );
-            const launchDir = new THREE.Vector3(Math.sin(fanAngle) * 0.6, Math.cos(k) * 0.28, -1)
-              .applyQuaternion(this.hero.group.quaternion)
-              .normalize();
-            const origin = this.hero.group.position.clone().add(offset);
-            const isLeader = k === 2;
-            const m = this.vfx.launchMissile(
-              `macross_${k}`,
-              origin,
-              launchDir.multiplyScalar(320),
-              this.ace,
-              true,
-              405 + k * 14,
-              (hitPos) => {
-                if (this.ace.alive) {
-                  this.ace.alive = false;
-                  this.featuredMissile = null;
-                  // COLOSSAL THERMOBARIC SUPERNOVA SKY DETONATION!
-                  this.vfx.spawnExplosion(hitPos, 155, true, Math.max(tripIntensity, 1.0));
-                  this.vfx.spawnExplosion(
-                    hitPos.clone().add(new THREE.Vector3(28, 16, -18)),
-                    88,
-                    false,
-                    1.0,
-                  );
-                  this.vfx.spawnExplosion(
-                    hitPos.clone().add(new THREE.Vector3(-32, -14, 22)),
-                    82,
-                    false,
-                    1.0,
-                  );
-                  this.env.triggerOceanShockwave(hitPos, 1.85);
-                  this.callbacks.onSfx('sfx_supernova', 1.0, 0);
-                  this.cameraShake = 2.1;
-                }
-              },
-            );
-            if (isLeader) this.featuredMissile = m;
-          }
-        });
+      // Guaranteed Kill #5: CRIMSON-1 Ace thermobaric supernova fallback
+      if (t >= KILL_TIME_ACE && this.ace.alive && !this.triggeredEvents.has('kill_ace_fallback')) {
+        this.triggeredEvents.add('kill_ace_fallback');
+        this.killAce(this.ace.group.position, tripIntensity);
       }
 
-      // Safety fallback if Ace somehow evaded all missiles by t=69.6s
-      if (t >= 69.6 && this.ace.alive) {
-        this.fireOnce('supernova_failback', () => {
-          const hitPos = this.ace.group.position.clone();
-          this.ace.alive = false;
-          this.featuredMissile = null;
-          this.vfx.spawnExplosion(hitPos, 155, true, 1.0);
-          this.env.triggerOceanShockwave(hitPos, 1.85);
-          this.callbacks.onSfx('sfx_supernova', 1.0, 0);
-          this.cameraShake = 2.1;
-        });
-      }
-
-      // Act V Vertical Sunrise Mach punch
-      if (t >= 81.2) {
-        this.fireOnce('finale_boom', () => {
-          this.callbacks.onSfx('sfx_flyby', 0.9, 0);
-          this.cameraShake = Math.max(this.cameraShake, 0.7);
-        });
+      // Act V: Vertical Sunrise twin-afterburner Mach punch
+      if (t >= 81.2 && !this.triggeredEvents.has('finale_boom')) {
+        this.triggeredEvents.add('finale_boom');
+        this.callbacks.onSfx('sfx_flyby', 0.92, 0);
+        this.env.triggerOceanShockwave(this.hero.group.position, 0.75);
+        this.cameraShake = Math.max(this.cameraShake, 0.72);
       }
     }
 
@@ -648,12 +1071,15 @@ export class DogfightChoreography {
     // 3. TARGET LOCK STATE FOR HUD & AIM-9 SIDEWINDER GROWL
     // ------------------------------------------------------------------
     let lockCandidate: FighterJet | null = null;
-    if (t >= 17 && t < 24.5 && this.bandits[1].alive) lockCandidate = this.bandits[1];
-    else if (t >= 31 && t < 37.5 && this.bandits[0].alive) lockCandidate = this.bandits[0];
-    else if (t >= 41 && t < 48.0 && this.bandits[2].alive) lockCandidate = this.bandits[2];
-    else if (t >= 53 && t < 69.5 && this.ace.alive) lockCandidate = this.ace;
+    if (t >= 16.5 && t < KILL_TIME_W2 && this.bandits[1].alive) lockCandidate = this.bandits[1];
+    else if (t >= 31.5 && t < KILL_TIME_W1 && this.bandits[0].alive) lockCandidate = this.bandits[0];
+    else if (t >= 41.0 && t < KILL_TIME_W3 && this.bandits[2].alive) lockCandidate = this.bandits[2];
+    else if (t >= 47.2 && t < KILL_TIME_W4 && this.bandits[3].alive) lockCandidate = this.bandits[3];
+    else if (t >= 52.0 && t < KILL_TIME_ACE && this.ace.alive) lockCandidate = this.ace;
 
-    const lockedNow = lockCandidate !== null && ((t >= 32.5 && t <= 35.5) || (t >= 43.0 && t <= 46.5) || (t >= 61.0 && t <= 66.0));
+    const lockedNow =
+      lockCandidate !== null &&
+      ((t >= 32.5 && t <= 35.5) || (t >= 43.0 && t <= 46.8) || (t >= 61.0 && t <= 66.2));
     if (lockedNow !== this.isMissileLocked || lockCandidate !== this.lockedTarget) {
       this.isMissileLocked = lockedNow;
       this.lockedTarget = lockCandidate;
@@ -661,12 +1087,13 @@ export class DogfightChoreography {
     }
 
     // ------------------------------------------------------------------
-    // 4. 12-CAMERA VIRTUAL MICHAEL BAY / RIDLEY SCOTT DIRECTOR
+    // 4. 14-SHOT VIRTUAL MICHAEL BAY / RIDLEY SCOTT CAMERA DIRECTOR
     // ------------------------------------------------------------------
     this.cameraShake = Math.max(0, this.cameraShake - rawDt * 1.45);
-    this.updateCamera(rawDt, realTime, camera, camMode);
+    this.updateCameraInternal(rawDt, realTime, camera, camMode, false, isPlaying, false);
 
-    return { tripIntensity };
+    this._updateResult.tripIntensity = tripIntensity;
+    return this._updateResult;
   }
 
   public updateCamera(
@@ -676,206 +1103,33 @@ export class DogfightChoreography {
     mode: CameraMode,
     forceSnap = false,
   ): void {
-    if (mode === 'orbit') {
-      this.activeCameraTag = 'FREE ORBIT';
-      this.lastShotCutId = 'orbit';
-      camera.up.set(0, 1, 0);
-      return; // Handled by OrbitControls in main.ts without overwriting user drag
-    }
+    const isPreLaunchIdle = !this.hasLaunchedOrReset && !this.lastIsPlaying && mode === 'cinematic';
+    this.updateCameraInternal(dt, realTime, camera, mode, forceSnap, this.lastIsPlaying, isPreLaunchIdle);
+  }
 
-    const t = this.currentTime;
-    const desiredPos = this._desiredPos;
-    const desiredLook = this._desiredLook;
-    let targetFov = 64;
-    let hardCutId: string = mode;
-    let useJetUp = false;
+  private updateCameraInternal(
+    dt: number,
+    realTime: number,
+    camera: THREE.PerspectiveCamera,
+    mode: CameraMode,
+    forceSnap: boolean,
+    isPlaying: boolean,
+    isPreLaunchIdle: boolean,
+  ): void {
+    const ctx = this._camCtx;
+    ctx.time = this.currentTime;
+    ctx.realTime = realTime;
+    ctx.dt = dt;
+    ctx.mode = mode;
+    ctx.forceSnap = forceSnap;
+    ctx.isPlaying = isPlaying;
+    ctx.isPreLaunchIdle = isPreLaunchIdle;
+    ctx.featuredMissile = this.featuredMissile;
+    ctx.cameraShake = this.cameraShake;
+    ctx.speedIntensity = this.speedIntensity;
+    ctx.shockImpact = this.vfx.shockImpact;
 
-    const heroPos = this.hero.group.position;
-    const heroQ = this.hero.group.quaternion;
-
-    if (mode === 'cockpit') {
-      this.hero.group.updateMatrixWorld(true);
-      this.hero.cockpitAnchor.getWorldPosition(desiredPos);
-      desiredLook.set(0, 0.2, -160).applyQuaternion(heroQ).add(desiredPos);
-      targetFov = 74;
-      this.activeCameraTag = 'COCKPIT HUD';
-      const isCut = forceSnap || this.lastShotCutId !== 'cockpit';
-      this.lastShotCutId = 'cockpit';
-      camera.up.set(0, 1, 0).applyQuaternion(heroQ).normalize();
-      camera.position.copy(desiredPos);
-      camera.lookAt(desiredLook);
-      camera.fov = isCut ? targetFov : THREE.MathUtils.lerp(camera.fov, targetFov, Math.min(1, dt * 8));
-      camera.updateProjectionMatrix();
-      return;
-    }
-
-    if (mode === 'chase') {
-      desiredPos.set(0, 5.2, 22).applyQuaternion(heroQ).add(heroPos);
-      desiredLook.set(0, 1.5, -60).applyQuaternion(heroQ).add(heroPos);
-      targetFov = 68;
-      this.activeCameraTag = 'TAIL CHASE';
-    } else if (mode === 'cinematic') {
-      const a = realTime * 0.55;
-      desiredPos.set(
-        heroPos.x + Math.cos(a) * 34,
-        heroPos.y + 10 + Math.sin(a * 1.3) * 6,
-        heroPos.z + Math.sin(a) * 34,
-      );
-      desiredLook.copy(heroPos);
-      targetFov = 54;
-      this.activeCameraTag = 'BAYHEM ORBIT';
-    } else {
-      // DIRECTOR AUTO: 12 bespoke choreographed camera cuts across 88 seconds!
-      if (t < 6.0) {
-        hardCutId = 'cut_low_skim';
-        this.activeCameraTag = 'LOW SEA SKIM';
-        desiredPos.set(16, -2.2, -26).applyQuaternion(heroQ).add(heroPos);
-        desiredPos.y = Math.max(11, desiredPos.y);
-        desiredLook.copy(heroPos);
-        desiredLook.y += 2;
-        desiredLook.z += 10;
-        targetFov = 58;
-      } else if (t < 13.5) {
-        hardCutId = 'cut_wingtip_mach';
-        this.activeCameraTag = 'WINGTIP MACH CAM';
-        desiredPos.set(-13.5, 2.8, 12.5).applyQuaternion(heroQ).add(heroPos);
-        desiredLook.set(2, 0.5, -40).applyQuaternion(heroQ).add(heroPos);
-        targetFov = 76;
-      } else if (t < 20.5) {
-        hardCutId = 'cut_canyon_wide';
-        this.activeCameraTag = 'RIDLEY SCALE WIDE';
-        desiredPos.set(28, 12, 34).applyQuaternion(heroQ).add(heroPos);
-        desiredLook.copy(this.bandits[1].alive ? this.bandits[1].group.position : heroPos).lerp(heroPos, 0.55);
-        targetFov = 60;
-      } else if (t < 24.4) {
-        hardCutId = 'cut_cockpit_guns';
-        this.activeCameraTag = 'COCKPIT GUNSIGHT';
-        this.hero.group.updateMatrixWorld(true);
-        this.hero.cockpitAnchor.getWorldPosition(desiredPos);
-        desiredLook.set(0, 0.2, -160).applyQuaternion(heroQ).add(desiredPos);
-        targetFov = 68;
-        useJetUp = true;
-      } else if (t < 29.0) {
-        hardCutId = 'cut_w2_pyro';
-        this.activeCameraTag = 'SLOW-MO PYRO PASS';
-        desiredPos.set(-22, 9, 18).applyQuaternion(heroQ).add(heroPos);
-        this._auxVec.set(0, 0, -24).applyQuaternion(heroQ);
-        desiredLook.copy(heroPos).add(this._auxVec);
-        targetFov = 62;
-      } else if (t < 38.0) {
-        hardCutId = 'cut_supercell_climb';
-        this.activeCameraTag = 'SUPERCELL ASCENT';
-        desiredPos.set(18, -4.5, 24).applyQuaternion(heroQ).add(heroPos);
-        this._auxVec.set(0, 6, -45).applyQuaternion(heroQ);
-        desiredLook.copy(heroPos).add(this._auxVec);
-        targetFov = 72;
-      } else if (t < 44.5) {
-        hardCutId = 'cut_monolith_pan';
-        this.activeCameraTag = 'MONOLITH CATHEDRAL';
-        const sweep = (t - 38.0) * 0.42;
-        desiredPos.set(heroPos.x + Math.cos(sweep) * 34, heroPos.y + 11, heroPos.z + Math.sin(sweep) * 34);
-        desiredLook.copy(heroPos);
-        targetFov = 66;
-      } else if (t < 49.8 && this.featuredMissile && this.featuredMissile.alive) {
-        hardCutId = 'cut_missile_cam';
-        this.activeCameraTag = 'SIDEWINDER NOSE CAM';
-        this._mDir.copy(this.featuredMissile.vel).normalize();
-        desiredPos.copy(this.featuredMissile.pos).addScaledVector(this._mDir, -14);
-        desiredPos.x += 2.5;
-        desiredPos.y += 3.2;
-        desiredLook.copy(this.featuredMissile.pos).addScaledVector(this._mDir, 45);
-        targetFov = 78;
-      } else if (t < 56.2) {
-        hardCutId = 'cut_ace_duel';
-        this.activeCameraTag = 'ACE HEAD-ON';
-        desiredPos.set(15, 6, 26).applyQuaternion(heroQ).add(heroPos);
-        desiredLook.copy(this.ace.alive ? this.ace.group.position : heroPos).lerp(heroPos, 0.45);
-        targetFov = 64;
-      } else if (t < 63.2) {
-        // ICONIC 360-DEGREE MICHAEL BAY BULLET-TIME ORBIT AROUND INVERTED COBRA!
-        hardCutId = 'cut_cobra_360';
-        this.activeCameraTag = '360° COBRA BULLET-TIME';
-        const angle = ((t - 56.2) / 7.0) * Math.PI * 2.2 + 0.6;
-        desiredPos.set(
-          heroPos.x + Math.cos(angle) * 24,
-          heroPos.y + 4 + Math.sin(angle * 2) * 5,
-          heroPos.z + Math.sin(angle) * 24,
-        );
-        desiredLook.copy(heroPos);
-        targetFov = 56;
-      } else if (t < 69.2) {
-        hardCutId = 'cut_macross_salvo';
-        this.activeCameraTag = 'MACROSS PRISM SALVO';
-        if (this.featuredMissile && this.featuredMissile.alive && t > 65.2) {
-          this._mDir.copy(this.featuredMissile.vel).normalize();
-          desiredPos.copy(this.featuredMissile.pos).addScaledVector(this._mDir, -24);
-          desiredPos.x -= 8;
-          desiredPos.y += 6;
-          desiredLook.copy(this.ace.alive ? this.ace.group.position : this.featuredMissile.pos);
-          targetFov = 74;
-        } else {
-          desiredPos.set(-18, 7, 25).applyQuaternion(heroQ).add(heroPos);
-          desiredLook.copy(this.ace.alive ? this.ace.group.position : heroPos);
-          targetFov = 68;
-        }
-      } else if (t < 75.5) {
-        hardCutId = 'cut_supernova_wide';
-        this.activeCameraTag = 'THERMOBARIC SUPERNOVA';
-        desiredPos.set(34, 14, 42).applyQuaternion(heroQ).add(heroPos);
-        desiredLook.copy(heroPos).lerp(this._supernovaFocus, 0.55);
-        targetFov = 72;
-      } else if (t < 81.5) {
-        hardCutId = 'cut_victory_roll';
-        this.activeCameraTag = 'VICTORY ROLL';
-        desiredPos.set(16, 4, -22).applyQuaternion(heroQ).add(heroPos);
-        desiredLook.copy(heroPos);
-        targetFov = 60;
-      } else {
-        hardCutId = 'cut_vertical_sun';
-        this.activeCameraTag = 'VERTICAL SUNRISE';
-        desiredPos.set(heroPos.x + 38, heroPos.y - 28, heroPos.z + 42);
-        desiredLook.set(heroPos.x - 12, heroPos.y + 24, heroPos.z - 18);
-        targetFov = 66;
-      }
-    }
-
-    // Snap cleanly on director cut transitions, smooth damp inside each shot
-    const didSnap = forceSnap || hardCutId !== this.lastShotCutId;
-    if (didSnap) {
-      this.lastShotCutId = hardCutId;
-      this.smoothCamPos.copy(desiredPos);
-      this.smoothCamLook.copy(desiredLook);
-    } else {
-      const followRate = hardCutId === 'cut_cockpit_guns' ? 28 : 7.5;
-      const alpha = 1 - Math.exp(-followRate * Math.max(dt, 0.016));
-      this.smoothCamPos.lerp(desiredPos, alpha);
-      this.smoothCamLook.lerp(desiredLook, alpha);
-    }
-
-    // Prevent camera from dipping under ocean waves
-    this.smoothCamPos.y = Math.max(10, this.smoothCamPos.y);
-
-    if (useJetUp) {
-      this._jetUp.set(0, 1, 0).applyQuaternion(heroQ).normalize();
-      camera.up.copy(this._jetUp);
-    } else {
-      camera.up.set(0, 1, 0);
-    }
-
-    // Apply kinetic Michael Bay camera shake
-    const shakeMag = this.cameraShake * 2.4 + this.speedIntensity * 0.14;
-    this._shakeVec.set(
-      (Math.sin(realTime * 47.3) + Math.cos(realTime * 81.7)) * 0.5 * shakeMag,
-      (Math.cos(realTime * 53.1) + Math.sin(realTime * 67.9)) * 0.5 * shakeMag,
-      Math.sin(realTime * 39.7) * 0.5 * shakeMag,
-    );
-
-    camera.position.copy(this.smoothCamPos).add(this._shakeVec);
-    camera.lookAt(this.smoothCamLook);
-
-    // Dynamic FOV punch during high-speed / explosions
-    const dynamicFov = targetFov + this.speedIntensity * 6.0 + this.vfx.shockImpact * 7.5;
-    camera.fov = didSnap ? dynamicFov : THREE.MathUtils.lerp(camera.fov, dynamicFov, Math.min(1, dt * 6));
-    camera.updateProjectionMatrix();
+    this.director.update(ctx, camera);
+    this.activeCameraTag = this.director.activeCameraTag;
   }
 }
