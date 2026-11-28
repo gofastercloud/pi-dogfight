@@ -101,11 +101,24 @@ interface DebrisTrailSlot {
   prism: boolean;
 }
 
+const RADIO_EVENT_KEYS: readonly string[] = RADIO_CUES.map((cue) => `radio_${cue.id}`);
+
+const MACROSS_MISSILE_IDS: readonly string[] = [
+  'macross_0',
+  'macross_1',
+  'macross_2',
+  'macross_3',
+  'macross_4',
+  'macross_5',
+  'macross_6',
+  'macross_7',
+];
+
 const KILL_TIME_W2 = 24.5;
 const KILL_TIME_W1 = 37.1;
 const KILL_TIME_W3 = 47.6;
 const KILL_TIME_W4 = 49.4;
-const KILL_TIME_ACE = 69.4;
+const KILL_TIME_ACE = 69.45;
 
 const SCHEDULED_EVENTS: readonly (readonly [string, number])[] = [
   ['flyby1', 6.5],
@@ -271,16 +284,16 @@ export class DogfightChoreography {
     // ------------------------------------------------------------------
     // 5 BANDIT SPLINES CHOREOGRAPHED FOR TIGHT COMBAT ALIGNMENT
     // ------------------------------------------------------------------
-    // WRAITH-1 (Act III Sidewinder kill at ~36.8s)
+    // WRAITH-1 (Act III Sidewinder kill at ~36.85s)
     const cW1 = new THREE.CatmullRomCurve3([
       new THREE.Vector3(-180, 320, -1100),
       new THREE.Vector3(-40, 125, -820),
       new THREE.Vector3(135, 165, -1420),
       new THREE.Vector3(-190, 275, -1860),
-      new THREE.Vector3(-280, 415, -2060),
-      new THREE.Vector3(-220, 485, -1680), // Ahead-port of Viper-1 at t=34–37s
-      new THREE.Vector3(120, 540, -1320),
-      new THREE.Vector3(240, 515, -1560),
+      new THREE.Vector3(-340, 440, -1620),
+      new THREE.Vector3(-210, 520, -1160), // Ahead-port of Viper-1 at t=34–37s
+      new THREE.Vector3(140, 550, -1080),
+      new THREE.Vector3(260, 515, -1420),
     ]);
 
     // WRAITH-2 (Act II Vulcan gun kill at t=24.5s — anchored directly ahead of Viper-1's gunsight!)
@@ -300,51 +313,59 @@ export class DogfightChoreography {
     }
     const cW2 = new THREE.CatmullRomCurve3(w2Points);
 
-    // WRAITH-3 (Act III featured Sidewinder missile-nose cam kill at ~47.3s)
+    // WRAITH-3 (Act III featured Sidewinder missile-nose cam kill at ~47.48s)
     const cW3 = new THREE.CatmullRomCurve3([
       new THREE.Vector3(0, 370, -1180),
       new THREE.Vector3(-120, 185, -960),
       new THREE.Vector3(25, 235, -1560),
       new THREE.Vector3(-190, 390, -2020),
-      new THREE.Vector3(-165, 515, -1540),
-      new THREE.Vector3(75, 550, -1240),   // Crossing ahead of monolith cathedral during flares
-      new THREE.Vector3(295, 555, -1390),  // Target intercept zone at t=45–48s
-      new THREE.Vector3(210, 520, -1720),
+      new THREE.Vector3(-120, 515, -1420),
+      new THREE.Vector3(280, 555, -1020),  // Wide crossing arc for ~3s Sidewinder flare slalom
+      new THREE.Vector3(520, 560, -1240),  // Target intercept zone at t=47.5s
+      new THREE.Vector3(410, 525, -1720),
     ]);
 
-    // WRAITH-4 (wingman to WRAITH-3, cascading twin detonation at ~49.1s)
+    // WRAITH-4 (wingman to WRAITH-3, cascading twin detonation at ~49.15s)
     const cW4 = new THREE.CatmullRomCurve3([
       new THREE.Vector3(85, 390, -1240),
       new THREE.Vector3(145, 210, -980),
       new THREE.Vector3(-65, 260, -1600),
       new THREE.Vector3(-240, 415, -1980),
-      new THREE.Vector3(-120, 540, -1490),
-      new THREE.Vector3(125, 578, -1285),
-      new THREE.Vector3(345, 575, -1440),
-      new THREE.Vector3(255, 540, -1765),
+      new THREE.Vector3(-60, 540, -1380),
+      new THREE.Vector3(345, 585, -960),
+      new THREE.Vector3(600, 585, -1210),
+      new THREE.Vector3(490, 545, -1740),
     ]);
 
-    // CRIMSON-1 ACE (Act IV boss duel + 8-missile Macross supernova inside central monolith ring at t=69.3s)
+    // CRIMSON-1 ACE (Act IV duel + wide horseshoe evasion into central monolith ring supernova at ~69.25s!)
     const cAce = new THREE.CatmullRomCurve3([
-      new THREE.Vector3(0, 460, -1280),
-      new THREE.Vector3(0, 265, -1020),
-      new THREE.Vector3(190, 295, -1620),
-      new THREE.Vector3(-60, 450, -2120),
-      new THREE.Vector3(-290, 565, -1660),
-      new THREE.Vector3(170, 595, -1240),
-      new THREE.Vector3(310, 555, -1520),  // Act IV head-on merge (~52–56s)
-      new THREE.Vector3(95, 535, -1680),   // Overshoots past Viper-1 during inverted Cobra (~58–62s)
-      new THREE.Vector3(-145, 545, -1840), // Pulls wide arc ahead (~64–67s) for 8-missile Macross sweep
-      new THREE.Vector3(35, 528, -1545),   // Dead-centre inside central obsidian monolith ring at t=69.3s!
-      new THREE.Vector3(185, 505, -1760),
-      new THREE.Vector3(135, 455, -2040),
+      new THREE.Vector3(0, 480, -400),
+      new THREE.Vector3(750, 380, -1350),
+      new THREE.Vector3(-550, 340, -2350),
+      new THREE.Vector3(-880, 460, -900),
+      new THREE.Vector3(480, 520, -450),
+      new THREE.Vector3(880, 590, -1650),
+      new THREE.Vector3(-250, 640, -2650),
+      new THREE.Vector3(-820, 610, -1300),
+      new THREE.Vector3(380, 580, -720),
+      new THREE.Vector3(760, 565, -1850),
+      new THREE.Vector3(-320, 575, -2420),
+      new THREE.Vector3(-260, 555, -1480),
+      new THREE.Vector3(310, 548, -1180),
+      new THREE.Vector3(210, 538, -1580),
+      new THREE.Vector3(-190, 535, -1480),
+      new THREE.Vector3(240, 555, -1820),  // Breaks outward-starboard at Macross launch (~64.0s)
+      new THREE.Vector3(440, 615, -2320),  // Stretches all 8 Macross prism ribbons across sky (~65.8s)
+      new THREE.Vector3(-80, 600, -2180),  // High-G horseshoe turn back toward cathedral (~67.5s)
+      new THREE.Vector3(0, 522, -1550),    // Dead-centre inside central obsidian monolith ring at t~69.25s!
+      new THREE.Vector3(260, 485, -1320),
     ]);
 
     this.banditCurves = [cW1, cW2, cW3, cW4, cAce];
 
     // Pre-compute exact nominal kill anchors for paused scrubbing / supernova framing
     this.sampleBanditAt(1, KILL_TIME_W2, this._w2KillPos, this._fwd);
-    this.sampleBanditAt(4, KILL_TIME_ACE, this._supernovaFocus, this._fwd);
+    this.sampleBanditAt(4, 69.25, this._supernovaFocus, this._fwd);
 
     // Pre-allocate mutable camera director context (zero per-frame allocations)
     this._camCtx = {
@@ -395,8 +416,8 @@ export class DogfightChoreography {
     if (toTime > KILL_TIME_W4 + 0.05) this.bandits[3].alive = false;
     if (toTime > KILL_TIME_ACE + 0.05) this.ace.alive = false;
 
-    for (const cue of RADIO_CUES) {
-      if (cue.time < toTime - 0.35) this.triggeredEvents.add(`radio_${cue.id}`);
+    for (let i = 0; i < RADIO_CUES.length; i++) {
+      if (RADIO_CUES[i].time < toTime - 0.35) this.triggeredEvents.add(RADIO_EVENT_KEYS[i]);
     }
     for (let i = 0; i < SCHEDULED_EVENTS.length; i++) {
       const ev = SCHEDULED_EVENTS[i];
@@ -407,7 +428,7 @@ export class DogfightChoreography {
     this.updateAtmosphereAndTrip(this.currentTime);
     this.updateJetPoses(this.currentTime, 0.016, this.currentTime, this.autoTripIntensity);
     this.sampleBanditAt(1, KILL_TIME_W2, this._w2KillPos, this._fwd);
-    this.sampleBanditAt(4, KILL_TIME_ACE, this._supernovaFocus, this._fwd);
+    this.sampleBanditAt(4, 69.25, this._supernovaFocus, this._fwd);
 
     // Seed signature paused-preview pyrotechnics when scrubbing directly into climax beats
     if (toTime >= KILL_TIME_W2 - 0.05 && toTime <= 26.2) {
@@ -427,17 +448,17 @@ export class DogfightChoreography {
       this._initVel
         .subVectors(this.bandits[2].group.position, this._origin)
         .normalize()
-        .multiplyScalar(425);
+        .multiplyScalar(215);
       this.featuredMissile = this.vfx.launchMissile(
         'm_w3',
         this._origin,
         this._initVel,
         this.bandits[2],
         true,
-        425,
+        215,
         (hitPos) => this.killWraith3(hitPos, this.autoTripIntensity),
       );
-    } else if (toTime >= KILL_TIME_ACE - 0.1 && toTime <= 72.4) {
+    } else if (toTime >= KILL_TIME_ACE - 0.25 && toTime <= 72.4) {
       this.triggeredEvents.add('macross_salvo');
       this.triggeredEvents.add('kill_ace_fallback');
       this.ace.alive = false;
@@ -445,12 +466,6 @@ export class DogfightChoreography {
       this.vfx.spawnExplosion(this._supernovaFocus, 118, true, Math.max(this.autoTripIntensity, 1.0));
       this.env.triggerOceanShockwave(this._supernovaFocus, 1.95);
     }
-  }
-
-  private fireOnce(key: string, fn: () => void): void {
-    if (this.triggeredEvents.has(key)) return;
-    this.triggeredEvents.add(key);
-    fn();
   }
 
   private sampleFlight(
@@ -477,7 +492,7 @@ export class DogfightChoreography {
     outPos: THREE.Vector3,
     outFwd: THREE.Vector3,
   ): number {
-    const bSpan = idx === 1 ? 30.5 : idx === 0 ? 45.5 : idx < 4 ? 58.0 : 81.5;
+    const bSpan = idx === 1 ? 30.5 : idx === 0 ? 45.5 : idx < 4 ? 58.0 : 72.0;
     const bu = THREE.MathUtils.clamp((t + 1.5) / bSpan, 0, 0.995);
     return this.sampleFlight(this.banditCurves[idx], bu, outPos, outFwd, false);
   }
@@ -504,11 +519,11 @@ export class DogfightChoreography {
     const fwd = this._fwd;
     let heroBank = this.sampleFlight(this.heroCurve, uHero, pos, fwd, false);
 
-    // Signature hero stunts: Act I barrel roll, Act IV inverted Cobra, Act V victory roll
+    // Signature hero stunts: monotonic Act I barrel roll, Act IV inverted Cobra, Act V victory roll
     let extraPitch = 0;
     if (t > 9.4 && t < 12.6) {
       const p = (t - 9.4) / 3.2;
-      heroBank += Math.sin(p * Math.PI) * Math.PI * 2;
+      heroBank += THREE.MathUtils.smoothstep(p, 0, 1) * Math.PI * 2;
     } else if (t > 56.2 && t < 63.0) {
       // Inverted Pugachev's Cobra!
       const p = (t - 56.2) / 6.8;
@@ -814,7 +829,7 @@ export class DogfightChoreography {
       targetTimeScale = 0.34; // WRAITH-2 slow-mo wing-shear fireball pass
     } else if (t > 56.4 && t < 62.6) {
       targetTimeScale = 0.28; // Inverted Pugachev's Cobra 360° bullet-time orbit
-    } else if (t > 69.2 && t < 72.6) {
+    } else if (t > 69.3 && t < 72.6) {
       targetTimeScale = 0.30; // CRIMSON-1 Ace thermobaric supernova blast
     }
     this.timeScale = THREE.MathUtils.lerp(this.timeScale, targetTimeScale, Math.min(1, rawDt * 6));
@@ -847,27 +862,32 @@ export class DogfightChoreography {
 
     // ------------------------------------------------------------------
     // 2. TRIGGER CHOREOGRAPHED RADIO, COMBAT, MISSILE & EXPLOSION BEATS
+    //    (Zero per-frame closures or template-string allocations)
     // ------------------------------------------------------------------
     if (isPlaying) {
       for (let i = 0; i < RADIO_CUES.length; i++) {
         const cue = RADIO_CUES[i];
-        if (t >= cue.time) {
-          this.fireOnce(`radio_${cue.id}`, () => this.callbacks.onRadio(cue));
+        const radioKey = RADIO_EVENT_KEYS[i];
+        if (t >= cue.time && !this.triggeredEvents.has(radioKey)) {
+          this.triggeredEvents.add(radioKey);
+          this.callbacks.onRadio(cue);
         }
       }
 
       // Act I: Supersonic Mach 1 break & sea-stack near-miss ocean shockwave
-      if (t >= 6.5) {
-        this.fireOnce('flyby1', () => {
-          this.callbacks.onSfx('sfx_flyby', 0.95, 0.15);
-          this.cameraShake = Math.max(this.cameraShake, 0.72);
-          this.env.triggerOceanShockwave(this.hero.group.position, 0.75);
-        });
+      if (t >= 6.5 && !this.triggeredEvents.has('flyby1')) {
+        this.triggeredEvents.add('flyby1');
+        this.callbacks.onSfx('sfx_flyby', 0.95, 0.15);
+        this.cameraShake = Math.max(this.cameraShake, 0.72);
+        this.env.triggerOceanShockwave(this.hero.group.position, 0.75);
       }
 
       // Act II: 20mm Vulcan rotary cannon burst ripping into WRAITH-2 (t=20.8–24.45s)
       if (t >= 20.8 && t <= 24.45 && this.bandits[1].alive) {
-        this.fireOnce('guns1', () => this.callbacks.onSfx('sfx_vulcan', 0.94, 0));
+        if (!this.triggeredEvents.has('guns1')) {
+          this.triggeredEvents.add('guns1');
+          this.callbacks.onSfx('sfx_vulcan', 0.94, 0);
+        }
         this.gunTimer += rawDt;
         if (this.gunTimer > 0.062) {
           this.gunTimer = 0;
@@ -878,112 +898,104 @@ export class DogfightChoreography {
       }
 
       // Kill #1: WRAITH-2 wing-shear fireball in slow-mo!
-      if (t >= KILL_TIME_W2) {
-        this.fireOnce('kill_w2', () => this.killWraith2(tripIntensity));
+      if (t >= KILL_TIME_W2 && !this.triggeredEvents.has('kill_w2')) {
+        this.triggeredEvents.add('kill_w2');
+        this.killWraith2(tripIntensity);
       }
 
       // VIPER-1 pops golden decoy flare blossom banking clear of fireball
-      if (t >= 27.4) {
-        this.fireOnce('flares1', () => {
-          this.vfx.popDecoyFlares(this.hero, 14);
-          this.callbacks.onSfx('sfx_flares', 0.88, 0.1);
-        });
+      if (t >= 27.4 && !this.triggeredEvents.has('flares1')) {
+        this.triggeredEvents.add('flares1');
+        this.vfx.popDecoyFlares(this.hero, 14);
+        this.callbacks.onSfx('sfx_flares', 0.88, 0.1);
       }
 
-      // Act III: Sidewinder launch & guaranteed Kill #2 on WRAITH-1
-      if (t >= 33.8) {
-        this.fireOnce('missile_w1', () => {
-          this._offset.set(-4.5, -1.0, 0).applyQuaternion(this.hero.group.quaternion);
-          this._origin.copy(this.hero.group.position).add(this._offset);
-          this._initVel.copy(this.hero.velocity);
-          if (this._initVel.lengthSq() < 1) {
-            this._initVel.set(0, 0, -1).applyQuaternion(this.hero.group.quaternion);
-          } else {
-            this._initVel.normalize();
-          }
-          this._initVel.multiplyScalar(320);
-          this.callbacks.onSfx('sfx_missile', 0.92, -0.2);
-          this.vfx.launchMissile('m_w1', this._origin, this._initVel, this.bandits[0], true, 475, (hitPos) => {
-            this.killWraith1(hitPos, tripIntensity);
-          });
+      // Act III: Sidewinder launch (~3.05s flight -> impacts WRAITH-1 at ~36.85s)
+      if (t >= 33.8 && !this.triggeredEvents.has('missile_w1')) {
+        this.triggeredEvents.add('missile_w1');
+        this._offset.set(-4.5, -1.0, 0).applyQuaternion(this.hero.group.quaternion);
+        this._origin.copy(this.hero.group.position).add(this._offset);
+        this._initVel.copy(this.hero.velocity);
+        if (this._initVel.lengthSq() < 1) {
+          this._initVel.set(0, 0, -1).applyQuaternion(this.hero.group.quaternion);
+        } else {
+          this._initVel.normalize();
+        }
+        this._initVel.multiplyScalar(290);
+        this.callbacks.onSfx('sfx_missile', 0.92, -0.2);
+        this.vfx.launchMissile('m_w1', this._origin, this._initVel, this.bandits[0], true, 375, (hitPos) => {
+          this.killWraith1(hitPos, tripIntensity);
         });
       }
-      if (t >= KILL_TIME_W1 && this.bandits[0].alive) {
-        this.fireOnce('kill_w1_fallback', () => {
-          this.killWraith1(this.bandits[0].group.position, tripIntensity);
-        });
+      if (t >= KILL_TIME_W1 && this.bandits[0].alive && !this.triggeredEvents.has('kill_w1_fallback')) {
+        this.triggeredEvents.add('kill_w1_fallback');
+        this.killWraith1(this.bandits[0].group.position, tripIntensity);
       }
 
       // Supercell decoy flare curtains popped by WRAITH-3 & WRAITH-4
-      if (t >= 41.5) {
-        this.fireOnce('flares2', () => {
-          if (this.bandits[2].alive) this.vfx.popDecoyFlares(this.bandits[2], 12);
-          if (this.bandits[3].alive) this.vfx.popDecoyFlares(this.bandits[3], 12);
-          this.callbacks.onSfx('sfx_flares', 0.84, 0.25);
-        });
+      if (t >= 41.5 && !this.triggeredEvents.has('flares2')) {
+        this.triggeredEvents.add('flares2');
+        if (this.bandits[2].alive) this.vfx.popDecoyFlares(this.bandits[2], 12);
+        if (this.bandits[3].alive) this.vfx.popDecoyFlares(this.bandits[3], 12);
+        this.callbacks.onSfx('sfx_flares', 0.84, 0.25);
       }
 
-      // Act III: Featured Sidewinder Missile-Nose Cam slalom through flares -> Kill #3 (WRAITH-3)
-      if (t >= 44.5) {
-        this.fireOnce('missile_w3', () => {
-          this._offset.set(5.0, -1.0, 0).applyQuaternion(this.hero.group.quaternion);
-          this._origin.copy(this.hero.group.position).add(this._offset);
-          this._initVel.copy(this.hero.velocity);
-          if (this._initVel.lengthSq() < 1) {
-            this._initVel.set(0, 0, -1).applyQuaternion(this.hero.group.quaternion);
-          } else {
-            this._initVel.normalize();
-          }
-          this._initVel.multiplyScalar(285);
-          this.callbacks.onSfx('sfx_missile', 0.95, 0.2);
-          this.featuredMissile = this.vfx.launchMissile(
-            'm_w3',
-            this._origin,
-            this._initVel,
-            this.bandits[2],
-            true,
-            425,
-            (hitPos) => this.killWraith3(hitPos, tripIntensity),
-          );
-        });
+      // Act III: Featured Sidewinder Missile-Nose Cam (~3.0s slalom through flares -> Kill #3 at ~47.48s)
+      if (t >= 44.5 && !this.triggeredEvents.has('missile_w3')) {
+        this.triggeredEvents.add('missile_w3');
+        this._offset.set(5.0, -1.0, 0).applyQuaternion(this.hero.group.quaternion);
+        this._origin.copy(this.hero.group.position).add(this._offset);
+        this._initVel.copy(this.hero.velocity);
+        if (this._initVel.lengthSq() < 1) {
+          this._initVel.set(0, 0, -1).applyQuaternion(this.hero.group.quaternion);
+        } else {
+          this._initVel.normalize();
+        }
+        this._initVel.multiplyScalar(190);
+        this.callbacks.onSfx('sfx_missile', 0.95, 0.2);
+        this.featuredMissile = this.vfx.launchMissile(
+          'm_w3',
+          this._origin,
+          this._initVel,
+          this.bandits[2],
+          true,
+          215,
+          (hitPos) => this.killWraith3(hitPos, tripIntensity),
+        );
       }
 
       // Second mid-slalom flare burst right in front of the Sidewinder nose cam
-      if (t >= 44.8) {
-        this.fireOnce('flares3', () => {
-          if (this.bandits[2].alive) this.vfx.popDecoyFlares(this.bandits[2], 10);
-          this.callbacks.onSfx('sfx_flares', 0.78, 0.15);
+      if (t >= 44.8 && !this.triggeredEvents.has('flares3')) {
+        this.triggeredEvents.add('flares3');
+        if (this.bandits[2].alive) this.vfx.popDecoyFlares(this.bandits[2], 10);
+        this.callbacks.onSfx('sfx_flares', 0.78, 0.15);
+      }
+
+      // Second curving prism Sidewinder (~2.95s flight -> Kill #4 WRAITH-4 twin detonation at ~49.15s)
+      if (t >= 46.2 && !this.triggeredEvents.has('missile_w4')) {
+        this.triggeredEvents.add('missile_w4');
+        this._offset.set(-5.0, -1.0, 0).applyQuaternion(this.hero.group.quaternion);
+        this._origin.copy(this.hero.group.position).add(this._offset);
+        this._initVel.copy(this.hero.velocity);
+        if (this._initVel.lengthSq() < 1) {
+          this._initVel.set(0, 0, -1).applyQuaternion(this.hero.group.quaternion);
+        } else {
+          this._initVel.normalize();
+        }
+        this._initVel.multiplyScalar(190);
+        this.callbacks.onSfx('sfx_missile', 0.88, -0.2);
+        this.vfx.launchMissile('m_w4', this._origin, this._initVel, this.bandits[3], true, 210, (hitPos) => {
+          this.killWraith4(hitPos, tripIntensity);
         });
       }
 
-      // Second curving prism Sidewinder -> Kill #4 (WRAITH-4 cascading twin detonation!)
-      if (t >= 46.2) {
-        this.fireOnce('missile_w4', () => {
-          this._offset.set(-5.0, -1.0, 0).applyQuaternion(this.hero.group.quaternion);
-          this._origin.copy(this.hero.group.position).add(this._offset);
-          this._initVel.copy(this.hero.velocity);
-          if (this._initVel.lengthSq() < 1) {
-            this._initVel.set(0, 0, -1).applyQuaternion(this.hero.group.quaternion);
-          } else {
-            this._initVel.normalize();
-          }
-          this._initVel.multiplyScalar(295);
-          this.callbacks.onSfx('sfx_missile', 0.88, -0.2);
-          this.vfx.launchMissile('m_w4', this._origin, this._initVel, this.bandits[3], true, 445, (hitPos) => {
-            this.killWraith4(hitPos, tripIntensity);
-          });
-        });
+      if (t >= KILL_TIME_W3 && this.bandits[2].alive && !this.triggeredEvents.has('kill_w3_fallback')) {
+        this.triggeredEvents.add('kill_w3_fallback');
+        this.killWraith3(this.bandits[2].group.position, tripIntensity);
       }
-
-      if (t >= KILL_TIME_W3 && this.bandits[2].alive) {
-        this.fireOnce('kill_w3_fallback', () => {
-          this.killWraith3(this.bandits[2].group.position, tripIntensity);
-        });
-      }
-      if (t >= KILL_TIME_W4 && this.bandits[3].alive) {
-        this.fireOnce('kill_w4_fallback', () => {
-          this.killWraith4(this.bandits[3].group.position, tripIntensity);
-        });
+      if (t >= KILL_TIME_W4 && this.bandits[3].alive && !this.triggeredEvents.has('kill_w4_fallback')) {
+        this.triggeredEvents.add('kill_w4_fallback');
+        this.killWraith4(this.bandits[3].group.position, tripIntensity);
       }
 
       // Act IV: CRIMSON-1 Ace head-on Vulcan tracer stream
@@ -999,61 +1011,59 @@ export class DogfightChoreography {
       }
 
       // Inverted Pugachev's Cobra sonic boom + golden decoy flare blossom
-      if (t >= 56.8) {
-        this.fireOnce('cobra_boom', () => {
-          this.vfx.popDecoyFlares(this.hero, 18);
-          this.callbacks.onSfx('sfx_flyby', 0.92, 0);
-          this.callbacks.onSfx('sfx_flares', 0.9, 0);
-          this.cameraShake = Math.max(this.cameraShake, 0.88);
-        });
+      if (t >= 56.8 && !this.triggeredEvents.has('cobra_boom')) {
+        this.triggeredEvents.add('cobra_boom');
+        this.vfx.popDecoyFlares(this.hero, 18);
+        this.callbacks.onSfx('sfx_flyby', 0.92, 0);
+        this.callbacks.onSfx('sfx_flares', 0.9, 0);
+        this.cameraShake = Math.max(this.cameraShake, 0.88);
       }
 
       // 8-MISSILE MACROSS PRISM-TRAIL SALVO AT CRIMSON-1 ACE!
-      if (t >= 64.0) {
-        this.fireOnce('macross_salvo', () => {
-          this.callbacks.onSfx('sfx_missile', 1.0, 0);
-          const heroQ = this.hero.group.quaternion;
-          const heroPos = this.hero.group.position;
-          for (let k = 0; k < 8; k++) {
-            const norm = (k - 3.5) / 3.5;
-            const fanAngle = norm * 1.15;
-            this._offset.set(norm * 7.8, -1.1 + (k % 2 === 0 ? 0.45 : -0.35), 0).applyQuaternion(heroQ);
-            this._origin.copy(heroPos).add(this._offset);
+      // Leader (k=3) is fastest so Shot 12 tracks it cleanly across 65.5–69.2s into the monolith ring supernova
+      if (t >= 64.0 && !this.triggeredEvents.has('macross_salvo')) {
+        this.triggeredEvents.add('macross_salvo');
+        this.callbacks.onSfx('sfx_missile', 1.0, 0);
+        const heroQ = this.hero.group.quaternion;
+        const heroPos = this.hero.group.position;
+        for (let k = 0; k < 8; k++) {
+          const norm = (k - 3.5) / 3.5;
+          const fanAngle = norm * 1.15;
+          this._offset.set(norm * 7.8, -1.1 + (k % 2 === 0 ? 0.45 : -0.35), 0).applyQuaternion(heroQ);
+          this._origin.copy(heroPos).add(this._offset);
 
-            this._launchDir
-              .set(Math.sin(fanAngle) * 0.72, Math.cos(k * 1.35) * 0.34 + 0.12, -1.0)
-              .applyQuaternion(heroQ)
-              .normalize()
-              .multiplyScalar(310);
+          this._launchDir
+            .set(Math.sin(fanAngle) * 0.72, Math.cos(k * 1.35) * 0.34 + 0.12, -1.0)
+            .applyQuaternion(heroQ)
+            .normalize()
+            .multiplyScalar(230);
 
-            const m = this.vfx.launchMissile(
-              `macross_${k}`,
-              this._origin,
-              this._launchDir,
-              this.ace,
-              true,
-              325 + k * 14,
-              (hitPos) => this.killAce(hitPos, tripIntensity),
-            );
-            if (k === 3) this.featuredMissile = m;
-          }
-        });
+          const cruiseSpeed = 311 - Math.abs(k - 3) * 3;
+          const m = this.vfx.launchMissile(
+            MACROSS_MISSILE_IDS[k],
+            this._origin,
+            this._launchDir,
+            this.ace,
+            true,
+            cruiseSpeed,
+            (hitPos) => this.killAce(hitPos, tripIntensity),
+          );
+          if (k === 3) this.featuredMissile = m;
+        }
       }
 
       // Guaranteed Kill #5: CRIMSON-1 Ace thermobaric supernova fallback
-      if (t >= KILL_TIME_ACE && this.ace.alive) {
-        this.fireOnce('kill_ace_fallback', () => {
-          this.killAce(this.ace.group.position, tripIntensity);
-        });
+      if (t >= KILL_TIME_ACE && this.ace.alive && !this.triggeredEvents.has('kill_ace_fallback')) {
+        this.triggeredEvents.add('kill_ace_fallback');
+        this.killAce(this.ace.group.position, tripIntensity);
       }
 
       // Act V: Vertical Sunrise twin-afterburner Mach punch
-      if (t >= 81.2) {
-        this.fireOnce('finale_boom', () => {
-          this.callbacks.onSfx('sfx_flyby', 0.92, 0);
-          this.env.triggerOceanShockwave(this.hero.group.position, 0.75);
-          this.cameraShake = Math.max(this.cameraShake, 0.72);
-        });
+      if (t >= 81.2 && !this.triggeredEvents.has('finale_boom')) {
+        this.triggeredEvents.add('finale_boom');
+        this.callbacks.onSfx('sfx_flyby', 0.92, 0);
+        this.env.triggerOceanShockwave(this.hero.group.position, 0.75);
+        this.cameraShake = Math.max(this.cameraShake, 0.72);
       }
     }
 

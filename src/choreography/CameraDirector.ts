@@ -540,7 +540,7 @@ export class CameraDirector {
   ): void {
     hero.group.updateMatrixWorld(true);
     hero.cockpitAnchor.getWorldPosition(outPos);
-    // Subtle canopy sill clearance in jet-local space (guarantees > near=0.8 clearance in all maneuvers)
+    // Subtle canopy sill clearance in jet-local space (guarantees > near=0.8 clearance in all manoeuvres)
     this._auxA.set(0, 0.12, -0.18).applyQuaternion(hero.group.quaternion);
     outPos.add(this._auxA);
 
