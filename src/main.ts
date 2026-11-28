@@ -31,6 +31,9 @@ export interface DogfightDebugState {
   readonly tripIntensity: number;
   readonly isPlaying: boolean;
   readonly fps: number;
+  readonly audioBass: number;
+  readonly audioMid: number;
+  readonly audioBeat: number;
 }
 
 export interface DogfightDebugApi extends DogfightDebugState {
@@ -120,6 +123,19 @@ async function bootstrap(): Promise<void> {
   const audio = new AudioEngine();
   const hud = new FighterHUD(hudCanvas);
 
+  // Cache monolith energy conduit ShaderMaterials once for zero-allocation audio pulse
+  const monolithConduitMats: THREE.ShaderMaterial[] = [];
+  env.group.traverse((obj) => {
+    if (obj instanceof THREE.Mesh && obj.material instanceof THREE.ShaderMaterial) {
+      const uniforms = obj.material.uniforms;
+      if (uniforms && 'uReveal' in uniforms && 'uLightning' in uniforms) {
+        if (!monolithConduitMats.includes(obj.material)) {
+          monolithConduitMats.push(obj.material);
+        }
+      }
+    }
+  });
+
   let actHideTimer: number | null = null;
   let radioHideTimer: number | null = null;
 
@@ -158,10 +174,26 @@ async function bootstrap(): Promise<void> {
   let lastTripIntensity = 0;
   let currentFps = 60;
   let finaleShown = false;
+  let lastDisplayedSec = -1;
+  let lastScrubberVal = -1;
 
+  // Pre-allocated scratch vectors (zero per-frame heap allocations in animate loop)
   const orbitOffset = new THREE.Vector3(42, 18, 46);
   const prevOrbitHeroPos = new THREE.Vector3();
   const heroDelta = new THREE.Vector3();
+  const heroForward = new THREE.Vector3(0, 0, -1);
+
+  const syncTimelineDom = (sec: number, force = false) => {
+    const wholeSec = Math.max(0, Math.floor(sec));
+    if (force || wholeSec !== lastDisplayedSec) {
+      lastDisplayedSec = wholeSec;
+      timeCurrentEl.textContent = formatTime(sec);
+    }
+    if (force || Math.abs(sec - lastScrubberVal) >= 0.05) {
+      lastScrubberVal = sec;
+      scrubber.value = sec.toFixed(2);
+    }
+  };
 
   const renderHudNow = (realTime: number, tripIntensity: number) => {
     hud.render(
@@ -174,6 +206,7 @@ async function bootstrap(): Promise<void> {
       choreography.activeCameraTag,
       tripIntensity,
       choreography.timeScale,
+      isPlaying ? audio.beatPulse : 0,
     );
   };
 
@@ -204,18 +237,51 @@ async function bootstrap(): Promise<void> {
 
   const syncPlayButton = () => {
     btnPlay.textContent = isPlaying ? '❚❚' : '▶';
+    btnPlay.setAttribute('aria-pressed', String(isPlaying));
+  };
+
+  const toggleMute = () => {
+    audio.setMuted(!audio.isMuted);
+    btnMute.textContent = audio.isMuted ? '🔇' : '🔊';
+    btnMute.classList.toggle('active', audio.isMuted);
+    btnMute.setAttribute('aria-pressed', String(audio.isMuted));
+  };
+
+  const toggleHud = () => {
+    hud.enabled = !hud.enabled;
+    btnHud.classList.toggle('active', hud.enabled);
+    btnHud.setAttribute('aria-pressed', String(hud.enabled));
+    if (hasLaunched) {
+      const activeTrip = userTripOverride !== null ? userTripOverride : lastTripIntensity;
+      renderHudNow(performance.now() / 1000, activeTrip);
+    }
   };
 
   const startDemoFrom = async (startTime = 0) => {
     hasLaunched = true;
     finaleShown = false;
+    isScrubbing = false;
     launchOverlay.classList.add('hidden');
     finaleOverlay.classList.add('hidden');
+    actBanner.classList.add('hidden');
+    radioFeed.classList.add('hidden');
+    if (actHideTimer) {
+      window.clearTimeout(actHideTimer);
+      actHideTimer = null;
+    }
+    if (radioHideTimer) {
+      window.clearTimeout(radioHideTimer);
+      radioHideTimer = null;
+    }
+    document.body.classList.remove('no-letterbox');
     controlDock.classList.remove('hidden');
 
-    choreography.reset(startTime);
+    const clampedStart = THREE.MathUtils.clamp(startTime, 0, TOTAL_DURATION);
+    choreography.reset(clampedStart);
+    syncTimelineDom(choreography.currentTime, true);
     isPlaying = true;
     syncPlayButton();
+    applySceneFrame(0.016, clampedStart, false, true);
 
     try {
       await audio.unlockAndInit();
@@ -237,6 +303,7 @@ async function bootstrap(): Promise<void> {
     if (isPlaying) {
       if (choreography.currentTime >= TOTAL_DURATION - 0.1) {
         choreography.reset(0);
+        syncTimelineDom(0, true);
       }
       finaleOverlay.classList.add('hidden');
       finaleShown = false;
@@ -272,16 +339,8 @@ async function bootstrap(): Promise<void> {
   });
   btnPlay.addEventListener('click', () => void togglePlayPause());
   btnRestart.addEventListener('click', () => void startDemoFrom(0));
-
-  btnMute.addEventListener('click', () => {
-    audio.setMuted(!audio.isMuted);
-    btnMute.textContent = audio.isMuted ? '🔇' : '🔊';
-  });
-
-  btnHud.addEventListener('click', () => {
-    hud.enabled = !hud.enabled;
-    btnHud.classList.toggle('active', hud.enabled);
-  });
+  btnMute.addEventListener('click', toggleMute);
+  btnHud.addEventListener('click', toggleHud);
 
   camButtons.forEach((btn) => {
     btn.addEventListener('click', () => {
@@ -290,38 +349,69 @@ async function bootstrap(): Promise<void> {
     });
   });
 
+  const commitScrub = (targetT: number, resumeAudio: boolean) => {
+    const clampedT = THREE.MathUtils.clamp(Number.isFinite(targetT) ? targetT : 0, 0, TOTAL_DURATION);
+    if (clampedT < TOTAL_DURATION - 0.1) {
+      finaleShown = false;
+      finaleOverlay.classList.add('hidden');
+    }
+    choreography.reset(clampedT);
+    syncTimelineDom(choreography.currentTime, true);
+    applySceneFrame(0.016, clampedT, false, true);
+    if (resumeAudio && isPlaying) {
+      void audio
+        .unlockAndInit()
+        .then(() => {
+          if (isPlaying && !isScrubbing) {
+            audio.startPlayback(choreography.currentTime);
+          }
+        })
+        .catch(() => {
+          // Ignore audio resume failure during scrub
+        });
+    }
+  };
+
   scrubber.addEventListener('input', () => {
     isScrubbing = true;
-    const targetT = parseFloat(scrubber.value);
-    choreography.reset(targetT);
-    timeCurrentEl.textContent = formatTime(targetT);
+    commitScrub(parseFloat(scrubber.value), false);
   });
 
   scrubber.addEventListener('change', () => {
     isScrubbing = false;
-    const targetT = parseFloat(scrubber.value);
-    choreography.reset(targetT);
-    if (isPlaying) {
-      audio.startPlayback(targetT);
+    commitScrub(parseFloat(scrubber.value), true);
+  });
+
+  scrubber.addEventListener('pointerup', () => {
+    if (isScrubbing) {
+      isScrubbing = false;
+      commitScrub(parseFloat(scrubber.value), true);
     }
   });
 
   tripSlider.addEventListener('input', () => {
-    const val = parseFloat(tripSlider.value);
+    const val = THREE.MathUtils.clamp(parseFloat(tripSlider.value) || 0, 0, 1.5);
     userTripOverride = val;
     lastTripIntensity = val;
     tripValueEl.textContent = `${Math.round(val * 100)}%`;
+    if (hasLaunched && !isPlaying) {
+      applySceneFrame(0.016, performance.now() / 1000, false, false);
+    }
   });
 
   tripSlider.addEventListener('dblclick', () => {
     userTripOverride = null;
     lastTripIntensity = choreography.autoTripIntensity;
     tripValueEl.textContent = 'AUTO';
+    if (hasLaunched && !isPlaying) {
+      applySceneFrame(0.016, performance.now() / 1000, false, false);
+    }
   });
 
   // Keyboard shortcuts
   window.addEventListener('keydown', (e) => {
     if (e.target instanceof HTMLInputElement) return;
+    const keyLower = e.key.toLowerCase();
     if (e.code === 'Space') {
       e.preventDefault();
       void togglePlayPause();
@@ -330,15 +420,10 @@ async function bootstrap(): Promise<void> {
     else if (e.key === '3') setCameraMode('chase');
     else if (e.key === '4') setCameraMode('orbit');
     else if (e.key === '5') setCameraMode('cinematic');
-    else if (e.key.toLowerCase() === 'h') {
-      hud.enabled = !hud.enabled;
-      btnHud.classList.toggle('active', hud.enabled);
-    } else if (e.key.toLowerCase() === 'm') {
-      audio.setMuted(!audio.isMuted);
-      btnMute.textContent = audio.isMuted ? '🔇' : '🔊';
-    } else if (e.key.toLowerCase() === 'r') {
-      void startDemoFrom(0);
-    } else if (e.key.toLowerCase() === 'l') {
+    else if (keyLower === 'h') toggleHud();
+    else if (keyLower === 'm') toggleMute();
+    else if (keyLower === 'r') void startDemoFrom(0);
+    else if (keyLower === 'l') {
       if (userTripOverride === null || userTripOverride < 1.2) {
         userTripOverride = 1.45;
         lastTripIntensity = 1.45;
@@ -350,10 +435,13 @@ async function bootstrap(): Promise<void> {
         tripSlider.value = '1.0';
         tripValueEl.textContent = 'AUTO';
       }
+      if (hasLaunched && !isPlaying) {
+        applySceneFrame(0.016, performance.now() / 1000, false, false);
+      }
     }
   });
 
-  // Auto-dim dock when mouse is idle during playback
+  // Auto-dim dock when pointer is idle during playback (desktop + tablet touch support)
   let dockIdleTimer: number | null = null;
   const bumpDockActivity = () => {
     controlDock.classList.remove('dimmed');
@@ -362,12 +450,15 @@ async function bootstrap(): Promise<void> {
       if (isPlaying) controlDock.classList.add('dimmed');
     }, 3200);
   };
-  window.addEventListener('mousemove', bumpDockActivity);
+  window.addEventListener('mousemove', bumpDockActivity, { passive: true });
+  window.addEventListener('pointerdown', bumpDockActivity, { passive: true });
+  window.addEventListener('touchstart', bumpDockActivity, { passive: true });
 
-  // Resize handling
+  // Resize handling (updates DPR too when moving between Retina and external displays)
   window.addEventListener('resize', () => {
-    const w = window.innerWidth;
-    const h = window.innerHeight;
+    const w = Math.max(1, window.innerWidth);
+    const h = Math.max(1, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
     camera.aspect = w / h;
     camera.updateProjectionMatrix();
     renderer.setSize(w, h);
@@ -412,31 +503,63 @@ async function bootstrap(): Promise<void> {
     }
 
     const simDt = advanceSim ? dt * choreography.timeScale : 0;
+
+    // Pass Viper-1 world position & pre-allocated forward vector for sea-spray wake
+    const heroPos = choreography.hero.group.position;
+    heroForward.set(0, 0, -1).applyQuaternion(choreography.hero.group.quaternion);
+    env.setHeroPosition(heroPos, heroForward);
+
+    // Subtle real-time Web Audio FFT sync driving LSD prism, monolith conduits, and bloom
+    const audioBass = isPlaying ? audio.bassEnergy : 0;
+    const audioMid = isPlaying ? audio.midEnergy : 0;
+    const audioBeat = isPlaying ? audio.beatPulse : 0;
+    const reactiveTrip = THREE.MathUtils.clamp(
+      tripIntensity + audioBass * 0.06 + audioBeat * 0.11,
+      0,
+      1.5,
+    );
+
     env.update(
       realTime,
       dt,
       camera.position,
       choreography.stormIntensity,
-      tripIntensity,
+      reactiveTrip,
       vfx.explosionFlash,
+      heroPos,
+      heroForward,
     );
-    vfx.update(simDt, realTime, camera, tripIntensity, choreography.speedIntensity);
 
-    // Fog smoothly tracks storm & acid vibe
+    // Pulse monolith energy conduits & rim illumination cleanly with bass/beat transients
+    const monolithPulse = audioBass * 0.24 + audioBeat * 0.48;
+    if (monolithPulse > 0.001) {
+      for (let i = 0; i < monolithConduitMats.length; i++) {
+        monolithConduitMats[i].uniforms.uLightning.value += monolithPulse;
+      }
+      env.rimLight.intensity += audioBass * 0.35 + audioBeat * 0.55;
+    }
+
+    vfx.update(simDt, realTime, camera, reactiveTrip, choreography.speedIntensity);
+
+    // Fog smoothly tracks storm & chromatic overdrive
     const fog = scene.fog as THREE.FogExp2;
     fog.color.setHSL(
-      tripIntensity > 0.25 ? (0.82 + Math.sin(realTime * 0.2) * 0.1) % 1 : 0.07,
-      0.38 + tripIntensity * 0.45,
+      reactiveTrip > 0.25 ? (0.82 + Math.sin(realTime * 0.2) * 0.1) % 1 : 0.07,
+      0.38 + reactiveTrip * 0.45,
       THREE.MathUtils.lerp(0.24, 0.12, choreography.stormIntensity),
     );
     fog.density = 0.00014 + choreography.stormIntensity * 0.00012;
 
     post.update(
       realTime,
-      tripIntensity,
+      reactiveTrip,
       vfx.shockImpact + choreography.cameraShake * 0.35,
       choreography.speedIntensity,
     );
+    if (audioBass > 0.001 || audioBeat > 0.001 || audioMid > 0.001) {
+      post.bloomPass.strength += audioBass * 0.10 + audioBeat * 0.16;
+      post.anamorphicPass.intensity += audioBeat * 0.10 + audioMid * 0.05;
+    }
     post.render();
     renderHudNow(realTime, tripIntensity);
   };
@@ -518,6 +641,9 @@ async function bootstrap(): Promise<void> {
     tripIntensity: userTripOverride !== null ? userTripOverride : lastTripIntensity,
     isPlaying,
     fps: currentFps,
+    audioBass: audio.bassEnergy,
+    audioMid: audio.midEnergy,
+    audioBeat: audio.beatPulse,
   });
 
   const debugApi: DogfightDebugApi = Object.freeze({
@@ -548,13 +674,21 @@ async function bootstrap(): Promise<void> {
     get fps() {
       return currentFps;
     },
+    get audioBass() {
+      return audio.bassEnergy;
+    },
+    get audioMid() {
+      return audio.midEnergy;
+    },
+    get audioBeat() {
+      return audio.beatPulse;
+    },
     getState: readState,
     seek(t: number) {
       const targetT = THREE.MathUtils.clamp(Number(t) || 0, 0, TOTAL_DURATION);
       choreography.reset(targetT);
       applySceneFrame(0.016, targetT, false, true);
-      scrubber.value = choreography.currentTime.toFixed(2);
-      timeCurrentEl.textContent = formatTime(choreography.currentTime);
+      syncTimelineDom(choreography.currentTime, true);
     },
     setCamera(mode: CameraMode) {
       setCameraMode(mode);
@@ -597,22 +731,35 @@ async function bootstrap(): Promise<void> {
       choreography.currentTime = 4.2;
       const { tripIntensity } = choreography.update(rawDt, realTime, camera, 'cinematic', 0.12, false);
       lastTripIntensity = tripIntensity;
-      env.update(realTime, rawDt, camera.position, 0.08, tripIntensity, 0);
+      heroForward.set(0, 0, -1).applyQuaternion(choreography.hero.group.quaternion);
+      env.setHeroPosition(choreography.hero.group.position, heroForward);
+      env.update(
+        realTime,
+        rawDt,
+        camera.position,
+        0.08,
+        tripIntensity,
+        0,
+        choreography.hero.group.position,
+        heroForward,
+      );
       vfx.update(rawDt, realTime, camera, tripIntensity, 0.3);
       post.update(realTime, tripIntensity, 0, 0.2);
       post.render();
       return;
     }
 
+    // Update real-time FFT audio analysis (zero heap allocations) before rendering frame
+    audio.updateAnalysis(rawDt, isPlaying && !isScrubbing);
+
     applySceneFrame(rawDt, realTime, isPlaying && !isScrubbing, false);
 
     // Update Web Audio continuous engine bed
     audio.updateContinuous(choreography.hero.throttle, choreography.timeScale, isPlaying);
 
-    // Sync scrubber & timeline clock
+    // Throttled scrubber & timeline clock DOM sync (avoids per-frame DOM thrashing at 120 fps)
     if (!isScrubbing) {
-      scrubber.value = choreography.currentTime.toFixed(2);
-      timeCurrentEl.textContent = formatTime(choreography.currentTime);
+      syncTimelineDom(choreography.currentTime);
     }
 
     // Show finale card at end of 88-second sequence

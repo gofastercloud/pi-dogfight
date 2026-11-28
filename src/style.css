@@ -22,6 +22,7 @@ body {
   position: relative;
   width: 100vw;
   height: 100vh;
+  height: 100dvh;
   overflow: hidden;
   background: radial-gradient(circle at center, #111626 0%, #03050a 100%);
 }
@@ -334,7 +335,7 @@ body.no-letterbox .letterbox-bottom {
 .control-dock {
   position: fixed;
   left: 50%;
-  bottom: 12px;
+  bottom: max(12px, env(safe-area-inset-bottom));
   transform: translateX(-50%);
   z-index: 25;
   width: min(880px, 94vw);
@@ -387,7 +388,18 @@ body.no-letterbox .letterbox-bottom {
   font-size: 11px;
   font-weight: 600;
   letter-spacing: 0.08em;
+  white-space: nowrap;
+  touch-action: manipulation;
   transition: background 0.15s, border-color 0.15s, color 0.15s;
+}
+
+.dock-btn:focus-visible,
+.cam-btn:focus-visible,
+.btn-engage:focus-visible,
+.btn-secondary:focus-visible,
+input[type='range']:focus-visible {
+  outline: 2px solid #ffba66;
+  outline-offset: 2px;
 }
 
 .dock-btn:hover,
@@ -460,4 +472,121 @@ input[type='range'] {
   color: rgba(145, 255, 200, 0.75);
   min-width: 48px;
   text-align: right;
+}
+
+/* Responsive tablet & compact desktop layouts */
+@media (max-width: 1024px) {
+  .launch-card,
+  .finale-card {
+    max-width: min(680px, 92vw);
+    padding: 30px 28px;
+  }
+
+  .control-dock {
+    width: min(820px, 96vw);
+    padding: 8px 12px;
+    gap: 6px;
+  }
+
+  .dock-btn,
+  .cam-btn {
+    min-height: 30px;
+    padding: 5px 9px;
+    font-size: 10.5px;
+  }
+
+  .radio-feed {
+    bottom: 15.5vh;
+    max-width: min(640px, 90vw);
+  }
+}
+
+@media (max-width: 768px) {
+  .letterbox {
+    height: 3.5vh;
+  }
+
+  .act-banner {
+    top: 6vh;
+  }
+
+  .launch-card,
+  .finale-card {
+    padding: 24px 20px;
+    border-radius: 10px;
+  }
+
+  .launch-tagline {
+    font-size: 13.5px;
+    margin-bottom: 20px;
+  }
+
+  .btn-engage {
+    padding: 13px 28px;
+    font-size: 13.5px;
+  }
+
+  .launch-hints {
+    margin-top: 16px;
+    gap: 8px 12px;
+    font-size: 10px;
+  }
+
+  .control-dock {
+    width: 96vw;
+    padding: 8px 10px;
+    gap: 6px;
+  }
+
+  .dock-row {
+    gap: 6px;
+  }
+
+  .dock-row-secondary {
+    gap: 6px 10px;
+  }
+
+  .cam-group {
+    flex: 1 1 auto;
+    gap: 4px;
+  }
+
+  .cam-btn {
+    padding: 5px 7px;
+    font-size: 10px;
+  }
+
+  .trip-control {
+    gap: 6px;
+  }
+
+  #trip-slider {
+    width: 78px;
+  }
+
+  .radio-feed {
+    bottom: 18vh;
+    padding: 8px 14px 10px;
+  }
+}
+
+@media (max-height: 600px) {
+  .launch-card,
+  .finale-card {
+    max-height: 92vh;
+    overflow-y: auto;
+    padding: 22px 28px;
+  }
+
+  .launch-tagline {
+    margin-bottom: 18px;
+  }
+
+  .launch-hints {
+    margin-top: 14px;
+  }
+
+  .radio-feed {
+    bottom: 94px;
+  }
 }

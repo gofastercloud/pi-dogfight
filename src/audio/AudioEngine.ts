@@ -22,6 +22,8 @@ export class AudioEngine {
   private sfxGain: GainNode | null = null;
   private radioGain: GainNode | null = null;
   private engineGain: GainNode | null = null;
+  private analyser: AnalyserNode | null = null;
+  private freqBins: Uint8Array<ArrayBuffer> | null = null;
 
   private readonly rawBuffers = new Map<string, ArrayBuffer>();
   private readonly decodedBuffers = new Map<string, AudioBuffer>();
@@ -31,6 +33,15 @@ export class AudioEngine {
   private lockOsc: OscillatorNode | null = null;
   private lockLfo: OscillatorNode | null = null;
   private lockGain: GainNode | null = null;
+
+  // Real-time FFT reactive telemetry (0..1), updated with zero per-frame allocations
+  public bassEnergy = 0;
+  public midEnergy = 0;
+  public beatPulse = 0;
+
+  private bassRunningAvg = 0;
+  private prevBass = 0;
+  private beatCooldown = 0;
 
   public isMuted = false;
   public isLoaded = false;
@@ -72,7 +83,17 @@ export class AudioEngine {
       this.masterGain = this.ctx.createGain();
       this.masterGain.gain.value = this.isMuted ? 0 : 0.92;
       this.masterGain.connect(compressor);
-      compressor.connect(this.ctx.destination);
+
+      // Passive FFT analyser inline on the mastered bus so every browser pulls live bins
+      this.analyser = this.ctx.createAnalyser();
+      this.analyser.fftSize = 512;
+      this.analyser.smoothingTimeConstant = 0.72;
+      this.analyser.minDecibels = -88;
+      this.analyser.maxDecibels = -18;
+      this.freqBins = new Uint8Array(new ArrayBuffer(this.analyser.frequencyBinCount));
+
+      compressor.connect(this.analyser);
+      this.analyser.connect(this.ctx.destination);
 
       this.musicGain = this.ctx.createGain();
       this.musicGain.gain.value = 0.72;
@@ -143,6 +164,7 @@ export class AudioEngine {
   public startPlayback(offsetSeconds = 0): void {
     if (!this.ctx || !this.musicGain || !this.engineGain) return;
     this.stopMusicAndEngine();
+    this.beatCooldown = 0;
 
     const musicBuf = this.decodedBuffers.get('music');
     if (musicBuf && offsetSeconds < musicBuf.duration - 0.1) {
@@ -253,6 +275,91 @@ export class AudioEngine {
     const now = this.ctx.currentTime;
     this.lockGain.gain.cancelScheduledValues(now);
     this.lockGain.gain.setTargetAtTime(locked ? 0.075 : 0.0, now, 0.04);
+  }
+
+  /**
+   * Samples the Web Audio AnalyserNode into pre-allocated bins and updates
+   * smoothed bassEnergy, midEnergy, and beatPulse (0..1) with zero heap allocations.
+   */
+  public updateAnalysis(dt: number, isPlaying: boolean): void {
+    const safeDt = Math.min(Math.max(Number.isFinite(dt) ? dt : 0.016, 0.001), 0.08);
+
+    if (
+      !isPlaying ||
+      this.isMuted ||
+      !this.ctx ||
+      this.ctx.state !== 'running' ||
+      !this.analyser ||
+      !this.freqBins
+    ) {
+      const decay = Math.exp(-safeDt * 8.0);
+      this.bassEnergy = this.bassEnergy * decay < 1e-4 ? 0 : this.bassEnergy * decay;
+      this.midEnergy = this.midEnergy * decay < 1e-4 ? 0 : this.midEnergy * decay;
+      this.beatPulse = this.beatPulse * decay < 1e-4 ? 0 : this.beatPulse * decay;
+      this.bassRunningAvg *= decay;
+      this.prevBass *= decay;
+      this.beatCooldown = Math.max(0, this.beatCooldown - safeDt);
+      return;
+    }
+
+    const bins = this.freqBins;
+    this.analyser.getByteFrequencyData(bins);
+
+    const len = bins.length;
+    const hzPerBin = this.ctx.sampleRate / this.analyser.fftSize;
+    const bassStart = Math.max(1, Math.floor(35 / hzPerBin));
+    const bassEnd = Math.min(len - 1, Math.max(bassStart + 1, Math.ceil(220 / hzPerBin)));
+    const midStart = Math.min(len - 1, Math.max(bassEnd + 1, Math.floor(250 / hzPerBin)));
+    const midEnd = Math.min(len - 1, Math.max(midStart + 1, Math.ceil(2400 / hzPerBin)));
+
+    let bassSum = 0;
+    for (let i = bassStart; i <= bassEnd; i++) {
+      bassSum += bins[i];
+    }
+    const rawBass = bassSum / ((bassEnd - bassStart + 1) * 255);
+
+    let midSum = 0;
+    for (let i = midStart; i <= midEnd; i++) {
+      midSum += bins[i];
+    }
+    const rawMid = midSum / ((midEnd - midStart + 1) * 255);
+
+    const targetBass = Math.min(1, Math.pow(Math.max(rawBass, 0), 1.15) * 1.28);
+    const targetMid = Math.min(1, Math.pow(Math.max(rawMid, 0), 1.1) * 1.22);
+
+    const attackAlpha = 1 - Math.exp(-safeDt * 22);
+    const releaseAlpha = 1 - Math.exp(-safeDt * 6.5);
+
+    this.bassEnergy +=
+      (targetBass - this.bassEnergy) * (targetBass > this.bassEnergy ? attackAlpha : releaseAlpha);
+    this.midEnergy +=
+      (targetMid - this.midEnergy) * (targetMid > this.midEnergy ? attackAlpha : releaseAlpha);
+
+    // Beat onset detection comparing instantaneous bass flux against a slow running baseline
+    const avgAlpha = 1 - Math.exp(-safeDt * 2.2);
+    this.bassRunningAvg += (targetBass - this.bassRunningAvg) * avgAlpha;
+    this.beatCooldown = Math.max(0, this.beatCooldown - safeDt);
+
+    const bassFlux = targetBass - this.prevBass;
+    if (
+      this.beatCooldown <= 0 &&
+      targetBass > 0.22 &&
+      (targetBass > this.bassRunningAvg * 1.22 + 0.05 || bassFlux > 0.14)
+    ) {
+      const onsetStrength = Math.min(1, 0.55 + Math.max(0, targetBass - this.bassRunningAvg) * 1.8);
+      if (onsetStrength > this.beatPulse) {
+        this.beatPulse = onsetStrength;
+      }
+      this.beatCooldown = 0.24;
+    }
+
+    this.beatPulse *= Math.exp(-safeDt * 6.2);
+    if (this.beatPulse < 1e-4) this.beatPulse = 0;
+
+    this.bassEnergy = Math.max(0, Math.min(1, this.bassEnergy));
+    this.midEnergy = Math.max(0, Math.min(1, this.midEnergy));
+    this.beatPulse = Math.max(0, Math.min(1, this.beatPulse));
+    this.prevBass = targetBass;
   }
 
   public updateContinuous(throttle: number, timeScale: number, isPlaying: boolean): void {
