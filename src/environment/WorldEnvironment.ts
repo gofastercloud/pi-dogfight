@@ -95,7 +95,7 @@ export class WorldEnvironment {
     // ------------------------------------------------------------------
     // 3. TWIN-ECLIPSE SKY, VOLUMETRIC CLOUDS, GOD-RAYS & 3D LIGHTNING
     // ------------------------------------------------------------------
-    this.skyAndClouds = new SkyAndClouds(this.sunDirection);
+    this.skyAndClouds = new SkyAndClouds(this.sunDirection, scene);
     this.group.add(this.skyAndClouds.group);
 
     // ------------------------------------------------------------------
